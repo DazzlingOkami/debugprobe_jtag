@@ -1,0 +1,5 @@
+/build/
+tools/font/__pycache__/
+tools/font/.charset_merged.txt
+tools/game/__pycache__/
+.DS_Store

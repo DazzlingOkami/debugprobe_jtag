@@ -1,0 +1,16 @@
+{
+    "cmake.configureOnOpen": false,
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "cortex-debug.JLinkGDBServerPath": "C:/Program Files (x86)/SEGGER/JLink/JLinkGDBServer.exe",
+    // "cortex-debug.JLinkGDBServerPath": "/Applications/SEGGER/JLink/JLinkGDBServerCLExe",
+    "cortex-debug.openocdPath": "D:/Program Files/OpenOCD-20211118-0.11.0/bin/openocd_rp2040.exe",
+    "cortex-debug.registerUseNaturalFormat": true,
+    "terminal.integrated.env.windows": {
+        "PICO_SDK_PATH":"D:/code/pico-sdk"
+    },
+    "terminal.integrated.env.osx": {
+        "PICO_SDK_FETCH_FROM_GIT":"ON",
+        "PICO_SDK_FETCH_FROM_GIT_PATH":"/Users/wanggaojie/work/pico_sdk_fetch",
+        "PICOTOOL_FETCH_FROM_GIT_PATH":"/Users/wanggaojie/work/pico_sdk_fetch"
+    }
+}

@@ -1,0 +1,163 @@
+#include "hardware/structs/usb.h"
+#include "tusb.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "dap/tusb_edpt_handler.h"
+#include "DAP.h"
+
+#define TUD_TASK_PRIO 2
+#define DAP_TASK_PRIO 3
+
+static void usb_thread(void *p)
+{
+#if (configNUMBER_OF_CORES > 1)
+    vTaskCoreAffinitySet(NULL, 1 << 0);
+#endif
+
+#ifdef PROBE_USB_CONNECTED_LED
+    gpio_init(PROBE_USB_CONNECTED_LED);
+    gpio_set_dir(PROBE_USB_CONNECTED_LED, GPIO_OUT);
+#endif
+
+    TickType_t wake;
+    wake = xTaskGetTickCount();
+    do {
+        tud_task();
+#ifdef PROBE_USB_CONNECTED_LED
+        if (!gpio_get(PROBE_USB_CONNECTED_LED) && tud_ready())
+            gpio_put(PROBE_USB_CONNECTED_LED, 1);
+        else
+            gpio_put(PROBE_USB_CONNECTED_LED, 0);
+#endif
+        // If suspended or disconnected, delay for 1ms (20 ticks)
+        if (tud_suspended() || !tud_connected())
+            xTaskDelayUntil(&wake, pdMS_TO_TICKS(1));
+        // Go to sleep for up to a tick if nothing to do
+        else if (!tud_task_event_ready())
+            xTaskDelayUntil(&wake, 1);
+    } while (1);
+}
+
+int usb_init(void){
+#if defined(CFG_TUD_MSC_ASYNC_IO) && (CFG_TUD_MSC_ASYNC_IO)
+    void msc_task_init(void);
+    msc_task_init();
+#endif
+
+    xTaskCreate(usb_thread, "USB", configMINIMAL_STACK_SIZE, NULL, TUD_TASK_PRIO, NULL);
+
+    return 0;
+}
+
+TaskHandle_t dap_taskhandle;
+
+static void dap_task_stop(void)
+{
+    if (dap_taskhandle != NULL)
+    {
+        vTaskSuspend(dap_taskhandle);
+        vTaskDelete(dap_taskhandle);
+        dap_taskhandle = NULL;
+    }
+}
+
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    probe_info("Suspended\n");
+    /* Join DAP threads? Or just suspend them, for transparency */
+    if (dap_taskhandle != NULL)
+        vTaskSuspend(dap_taskhandle);
+    /* slow down clk_sys for power saving ? */
+}
+
+void tud_resume_cb(void)
+{
+    probe_info("Resumed\n");
+    if (dap_taskhandle != NULL)
+        vTaskResume(dap_taskhandle);
+}
+
+void tud_unmount_cb(void)
+{
+    probe_info("Disconnected\n");
+    dap_task_stop();
+}
+
+void tud_mount_cb(void)
+{
+    probe_info("Connected, Configured\n");
+
+    /* A bus reset clears the configuration without unmounting, so a task from
+     * the previous enumeration may still exist. Recreate it to start from a
+     * clean state instead of resuming a possibly stale command loop. */
+    dap_task_stop();
+
+    /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */
+    xTaskCreate(dap_thread, "DAP", configMINIMAL_STACK_SIZE, NULL, DAP_TASK_PRIO, &dap_taskhandle);
+}
+
+
+uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen)
+{
+    // TODO not Implemented
+    (void) itf;
+    (void) report_id;
+    (void) report_type;
+    (void) buffer;
+    (void) reqlen;
+
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const* RxDataBuffer, uint16_t bufsize)
+{
+    uint32_t response_size = TU_MIN(CFG_TUD_HID_EP_BUFSIZE, bufsize);
+
+    // This doesn't use multiple report and report ID
+    (void) itf;
+    (void) report_id;
+    (void) report_type;
+
+    static uint8_t TxDataBuffer[CFG_TUD_HID_EP_BUFSIZE];
+    DAP_ProcessCommand(RxDataBuffer, TxDataBuffer);
+
+    tud_hid_report(0, TxDataBuffer, response_size);
+}
+
+#if (PROBE_DEBUG_PROTOCOL == PROTO_DAP_V2)
+extern uint8_t const desc_ms_os_20[];
+
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+{
+    // nothing to with DATA & ACK stage
+    if (stage != CONTROL_STAGE_SETUP) return true;
+
+    switch (request->bmRequestType_bit.type)
+    {
+        case TUSB_REQ_TYPE_VENDOR:
+        switch (request->bRequest)
+        {
+            case 1:
+            if ( request->wIndex == 7 )
+            {
+                // Get Microsoft OS 2.0 compatible descriptor
+                uint16_t total_len;
+                memcpy(&total_len, desc_ms_os_20+8, 2);
+
+                return tud_control_xfer(rhport, request, (void*) desc_ms_os_20, total_len);
+            }else
+            {
+                return false;
+            }
+
+            default: break;
+        }
+        break;
+        default: break;
+    }
+
+    // stall unknown request
+    return false;
+}
+#endif
+

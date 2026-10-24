@@ -1,0 +1,9 @@
+[submodule "lib/CMSIS-DAP"]
+	path = lib/CMSIS-DAP
+	url = https://github.com/ARM-software/CMSIS-DAP.git
+[submodule "lib/CMSIS_6"]
+	path = lib/CMSIS_6
+	url = https://github.com/ARM-software/CMSIS_6.git
+[submodule "lib/freertos"]
+	path = lib/freertos
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel

@@ -1,0 +1,598 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2024 DazzlingOkami
+ * Written by DazzlingOkami <kinghd1912@163.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ */
+
+#include <pico/stdlib.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "tusb.h"
+#include "swd/probe_config.h"
+#include "utils/ringbuf.h"
+#include "cdc_uart.h"
+#include "hardware/dma.h"
+
+#define RX_RINGBUF_SIZE (1024)
+#define TX_RINGBUF_SIZE (1024)
+
+RINGBUF_STATIC_ALLOC(rx_ringbuf, RX_RINGBUF_SIZE);
+RINGBUF_STATIC_ALLOC(tx_ringbuf, TX_RINGBUF_SIZE);
+
+TaskHandle_t uart_taskhandle;
+
+TickType_t last_wake, interval = 100;
+
+// Actually s^-1 so 25ms
+#define DEBOUNCE_MS 40
+static uint debounce_ticks = 5;
+
+#ifdef PROBE_UART_TX_LED
+static volatile uint tx_led_debounce;
+#endif
+
+#ifdef PROBE_UART_RX_LED
+static uint rx_led_debounce;
+#endif
+
+#define CDC_INTERFACE 0
+
+#define DMA_OR_IRQ 1    // 1:DMA 0:IRQ
+
+#if DMA_OR_IRQ
+static int uart_tx_dma_ch;
+static int uart_rx_dma_ch;
+
+static volatile int tx_dma_total = 0;
+static volatile int rx_dma_total = 0;
+
+static void dma_irq0_handler() {
+    if(dma_channel_get_irq0_status(uart_tx_dma_ch)) {
+        dma_channel_acknowledge_irq0(uart_tx_dma_ch);
+
+        ringbuf_consume(&tx_ringbuf, tx_dma_total);
+
+        int tx_len = 0;
+        const char *tx_buf = ringbuf_get_ptr(&tx_ringbuf, &tx_len);
+        if(tx_len > 0){
+            tx_dma_total = tx_len;
+            dma_channel_transfer_from_buffer_now(uart_tx_dma_ch, tx_buf, tx_len);
+        }
+    }
+
+    if(dma_channel_get_irq0_status(uart_rx_dma_ch)) {
+        dma_channel_acknowledge_irq0(uart_rx_dma_ch);
+
+        int dma_xfer_len = rx_dma_total - dma_channel_hw_addr(uart_rx_dma_ch)->transfer_count;
+        ringbuf_produce(&rx_ringbuf, dma_xfer_len);
+
+        char* rx_buf = ringbuf_puts_ptr(&rx_ringbuf, (int*)&rx_dma_total);
+        dma_channel_transfer_to_buffer_now(uart_rx_dma_ch, rx_buf, rx_dma_total);
+    }
+}
+#else
+static void cdc_uart_irq_handler(void){
+    if(uart_get_hw(PROBE_UART_INTERFACE)->ris & UART_UARTRIS_TXRIS_BITS){
+        uart_get_hw(PROBE_UART_INTERFACE)->icr |= UART_UARTICR_TXIC_BITS;
+        while(uart_is_writable(PROBE_UART_INTERFACE)){
+            int c = ringbuf_get(&tx_ringbuf);
+            if(c < 0)
+                break;
+            uart_get_hw(PROBE_UART_INTERFACE)->dr = (char)c;
+        }
+    }
+    if(uart_get_hw(PROBE_UART_INTERFACE)->ris & (UART_UARTRIS_RXRIS_BITS | UART_UARTRIS_RTRIS_BITS)){
+        while(uart_is_readable(PROBE_UART_INTERFACE)){
+            ringbuf_put(&rx_ringbuf, (char)uart_get_hw(PROBE_UART_INTERFACE)->dr);
+        }
+        uart_get_hw(PROBE_UART_INTERFACE)->icr |= (UART_UARTICR_RTIC_BITS | UART_UARTICR_RXIC_BITS);
+    }
+    if(uart_get_hw(PROBE_UART_INTERFACE)->ris){
+        uart_get_hw(PROBE_UART_INTERFACE)->icr |= 0xFFFFFFFF;
+    }
+}
+#endif
+
+static int baudrate_save = 0;
+int cdc_get_baudrate(void){
+    return baudrate_save;
+}
+
+void cdc_set_baudrate(int baudrate){
+    baudrate_save = baudrate;
+    uart_set_baudrate(PROBE_UART_INTERFACE, baudrate_save);
+}
+
+/* Current TX pin, defaults to the SWD side */
+static uint cdc_tx_pin = PROBE_UART_TX_SWD_PIN;
+
+/* UART format to restore when rebuilding the port; updated by tud_cdc_line_coding_cb() */
+static uint32_t new_baudrate = PROBE_UART_BAUDRATE;
+static uint32_t new_data_bits = 8;
+static uint32_t new_stop_bits = 1;
+static uart_parity_t new_parity = UART_PARITY_NONE;
+
+/* Hand TX to the given pin and release the other side */
+static void cdc_uart_tx_pin_config(uint pin) {
+    if(pin == PROBE_UART_TX_JTAG_PIN){
+        /* Drive TX onto GPIO12 first, then enable the output direction of the external buffer */
+        gpio_set_function(PROBE_UART_TX_JTAG_PIN,
+                          UART_FUNCSEL_NUM(PROBE_UART_INTERFACE, PROBE_UART_TX_JTAG_PIN));
+        gpio_set_pulls(PROBE_UART_TX_JTAG_PIN, 1, 0);
+        gpio_put(PROBE_UART_TX_OE_PIN, 1);
+        /* Hand GPIO0 over to PIO as TDI */
+        gpio_init(PROBE_UART_TX_SWD_PIN);
+        gpio_disable_pulls(PROBE_UART_TX_SWD_PIN);
+    }else{
+        /* Stop driving GPIO12 from the UART first, then drop the buffer output enable,
+         * and finally hand TX to GPIO0 */
+        gpio_init(PROBE_UART_TX_JTAG_PIN);
+        gpio_disable_pulls(PROBE_UART_TX_JTAG_PIN);
+        gpio_put(PROBE_UART_TX_OE_PIN, 0);
+        gpio_set_function(PROBE_UART_TX_SWD_PIN,
+                          UART_FUNCSEL_NUM(PROBE_UART_INTERFACE, PROBE_UART_TX_SWD_PIN));
+        gpio_set_pulls(PROBE_UART_TX_SWD_PIN, 1, 0);
+    }
+}
+
+/* Rebuild the UART: stop transfers, disable the UART, clear buffers, configure the pin, enable the UART,
+ * then restart DMA and interrupts */
+static void cdc_uart_reinit(void) {
+#if (configNUMBER_OF_CORES > 1)
+    /* The interrupt fires on the core that enabled it and must share core 0 with the CDC
+     * thread. No switch is needed when affinity is already core 0; otherwise (including unbound) move to core 0
+     * and restore before exit */
+    const UBaseType_t affinity = vTaskCoreAffinityGet(NULL);
+    const bool move_to_core0 = (affinity != (UBaseType_t)(1u << 0));
+
+    if(move_to_core0){
+        vTaskCoreAffinitySet(NULL, (UBaseType_t)(1u << 0));
+    }
+#endif
+
+    /* Abort UART transfer */
+#if DMA_OR_IRQ
+    irq_set_enabled(DMA_IRQ_0, false);
+    dma_channel_set_irq0_enabled(uart_rx_dma_ch, false);
+    dma_channel_abort(uart_rx_dma_ch);
+    dma_channel_acknowledge_irq0(uart_rx_dma_ch);
+    dma_channel_set_irq0_enabled(uart_tx_dma_ch, false);
+    dma_channel_abort(uart_tx_dma_ch);
+    dma_channel_acknowledge_irq0(uart_tx_dma_ch);
+#else
+    uart_set_irq_enables(PROBE_UART_INTERFACE, false, false);
+#endif
+
+    /* Disable the UART */
+    uart_deinit(PROBE_UART_INTERFACE);
+
+    /* Clear ringbuffers */
+    ringbuf_reset(&rx_ringbuf);
+    ringbuf_reset(&tx_ringbuf);
+    tud_cdc_n_write_clear(CDC_INTERFACE);
+    tud_cdc_n_read_flush(CDC_INTERFACE);
+
+    /* Reinitialize the UART and its TX pin */
+    cdc_uart_tx_pin_config(cdc_tx_pin);
+    uart_init(PROBE_UART_INTERFACE, new_baudrate);
+    uart_set_format(PROBE_UART_INTERFACE, new_data_bits, new_stop_bits, new_parity);
+    while(uart_is_readable(PROBE_UART_INTERFACE)){
+        uart_getc(PROBE_UART_INTERFACE);
+    }
+
+    /* Enable the UART IRQ */
+#if DMA_OR_IRQ
+    dma_channel_set_irq0_enabled(uart_rx_dma_ch, true);
+    dma_channel_set_irq0_enabled(uart_tx_dma_ch, true);
+    irq_set_enabled(DMA_IRQ_0, true);
+    char* rx_buf = ringbuf_puts_ptr(&rx_ringbuf, (int*)&rx_dma_total);
+    dma_channel_transfer_to_buffer_now(uart_rx_dma_ch, rx_buf, rx_dma_total);
+#else
+    uart_set_irq_enables(PROBE_UART_INTERFACE, true, true);
+#endif
+
+#if (configNUMBER_OF_CORES > 1)
+    if(move_to_core0){
+        vTaskCoreAffinitySet(NULL, affinity);
+    }
+#endif
+}
+
+void cdc_uart_set_tx_pin(uint pin) {
+    /* Only the two on-board TX pins are supported */
+    if((pin != PROBE_UART_TX_SWD_PIN) && (pin != PROBE_UART_TX_JTAG_PIN)){
+        return;
+    }
+    if(pin == cdc_tx_pin){
+        return;
+    }
+
+    cdc_tx_pin = pin;
+    cdc_uart_reinit();
+}
+
+void cdc_uart_init(void) {
+    /* External buffer direction pin: low selects the input direction */
+    gpio_init(PROBE_UART_TX_OE_PIN);
+    gpio_put(PROBE_UART_TX_OE_PIN, 0);
+    gpio_set_dir(PROBE_UART_TX_OE_PIN, GPIO_OUT);
+
+    gpio_set_function(PROBE_UART_RX, UART_FUNCSEL_NUM(PROBE_UART_INTERFACE, PROBE_UART_RX));
+    gpio_set_pulls(PROBE_UART_RX, 1, 0);
+    uart_init(PROBE_UART_INTERFACE, PROBE_UART_BAUDRATE);
+    cdc_set_baudrate(PROBE_UART_BAUDRATE);
+
+    /* TX defaults to GPIO0 (SWD side) */
+    cdc_uart_tx_pin_config(cdc_tx_pin);
+
+#ifdef PROBE_UART_TX_LED
+    tx_led_debounce = 0;
+    gpio_init(PROBE_UART_TX_LED);
+    gpio_set_dir(PROBE_UART_TX_LED, GPIO_OUT);
+#endif
+#ifdef PROBE_UART_RX_LED
+    rx_led_debounce = 0;
+    gpio_init(PROBE_UART_RX_LED);
+    gpio_set_dir(PROBE_UART_RX_LED, GPIO_OUT);
+#endif
+
+    /* Clear the UART */
+    sleep_ms(10);
+    while(uart_is_readable(PROBE_UART_INTERFACE)){
+        uart_getc(PROBE_UART_INTERFACE);
+    }
+
+#ifdef PROBE_UART_HWFC
+    /* HWFC implies that hardware flow control is implemented and the
+     * UART operates in "full-duplex" mode (See USB CDC PSTN120 6.3.12).
+     * Default to pulling in the active direction, so an unconnected CTS
+     * behaves the same as if CTS were not enabled. */
+    gpio_set_pulls(PROBE_UART_CTS, 0, 1);
+    gpio_set_function(PROBE_UART_RTS, GPIO_FUNC_UART);
+    gpio_set_function(PROBE_UART_CTS, GPIO_FUNC_UART);
+    uart_set_hw_flow(PROBE_UART_INTERFACE, true, true);
+#else
+#ifdef PROBE_UART_RTS
+    gpio_init(PROBE_UART_RTS);
+    gpio_set_dir(PROBE_UART_RTS, GPIO_OUT);
+    gpio_put(PROBE_UART_RTS, 1);
+#endif
+#endif
+
+#ifdef PROBE_UART_DTR
+    gpio_init(PROBE_UART_DTR);
+    gpio_set_dir(PROBE_UART_DTR, GPIO_OUT);
+    gpio_put(PROBE_UART_DTR, 1);
+#endif
+
+#if DMA_OR_IRQ == 0
+    uart_set_irq_enables(PROBE_UART_INTERFACE, true, true);
+    irq_set_exclusive_handler(UART1_IRQ, cdc_uart_irq_handler);
+    irq_set_enabled(UART1_IRQ, true);
+#else
+    uart_tx_dma_ch = dma_claim_unused_channel(true);
+    uart_rx_dma_ch = dma_claim_unused_channel(true);
+
+    dma_channel_config tx_config = dma_channel_get_default_config(uart_tx_dma_ch);
+    channel_config_set_transfer_data_size(&tx_config, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx_config, true);
+    channel_config_set_write_increment(&tx_config, false);
+    channel_config_set_dreq(&tx_config, uart_get_dreq_num(PROBE_UART_INTERFACE, true));
+    dma_channel_set_write_addr(uart_tx_dma_ch, &(uart_get_hw(PROBE_UART_INTERFACE)->dr), false);
+    dma_channel_set_config(uart_tx_dma_ch, &tx_config, false);
+    dma_channel_set_irq0_enabled(uart_tx_dma_ch, true);
+
+    dma_channel_config rx_config = dma_channel_get_default_config(uart_rx_dma_ch);
+    channel_config_set_transfer_data_size(&rx_config, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx_config, false);
+    channel_config_set_write_increment(&rx_config, true);
+    channel_config_set_dreq(&rx_config, uart_get_dreq_num(PROBE_UART_INTERFACE, false));
+    dma_channel_set_read_addr(uart_rx_dma_ch, &(uart_get_hw(PROBE_UART_INTERFACE)->dr), false);
+    dma_channel_set_config(uart_rx_dma_ch, &rx_config, false);
+    dma_channel_set_irq0_enabled(uart_rx_dma_ch, true);
+
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq0_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    /* start dma recv */
+    char* rx_buf = ringbuf_puts_ptr(&rx_ringbuf, (int*)&rx_dma_total);
+    dma_channel_transfer_to_buffer_now(uart_rx_dma_ch, rx_buf, rx_dma_total);
+#endif
+}
+
+bool cdc_task(void){
+    bool keep_alive = false;
+
+#ifdef PROBE_UART_TX_LED
+    if (tx_led_debounce)
+        tx_led_debounce--;
+    else
+        gpio_put(PROBE_UART_TX_LED, 0);
+#endif
+#ifdef PROBE_UART_RX_LED
+    if (rx_led_debounce)
+        rx_led_debounce--;
+    else
+        gpio_put(PROBE_UART_RX_LED, 0);
+#endif
+
+    if(tud_cdc_n_available(CDC_INTERFACE)){
+        char* tx_buf;
+        int tx_buf_len;
+        tx_buf = ringbuf_puts_ptr(&tx_ringbuf, &tx_buf_len);
+        int xfer_len = MIN(tx_buf_len, tud_cdc_n_available(CDC_INTERFACE));
+        if(xfer_len > 0){
+            tud_cdc_n_read(CDC_INTERFACE, tx_buf, xfer_len);
+
+#if DMA_OR_IRQ == 0
+            ringbuf_produce(&tx_ringbuf, xfer_len);
+            while(uart_is_writable(PROBE_UART_INTERFACE) && ringbuf_elements(&tx_ringbuf) > 0){
+                char c = ringbuf_get(&tx_ringbuf);
+                uart_get_hw(PROBE_UART_INTERFACE)->dr = c;
+            }
+#else
+            irq_set_enabled(DMA_IRQ_0, false);
+            ringbuf_produce(&tx_ringbuf, xfer_len);
+            if(dma_channel_is_busy(uart_tx_dma_ch) == false &&
+               dma_channel_get_irq0_status(uart_tx_dma_ch) == false){
+                int tx_len = 0;
+                const char *dma_buf = ringbuf_get_ptr(&tx_ringbuf, &tx_len);
+                tx_dma_total = tx_len;
+                if(tx_len > 0){
+                    dma_channel_transfer_from_buffer_now(uart_tx_dma_ch, dma_buf, tx_len);
+                }
+            }
+            irq_set_enabled(DMA_IRQ_0, true);
+#endif
+        }
+        keep_alive = true;
+
+#ifdef PROBE_UART_TX_LED
+        gpio_put(PROBE_UART_TX_LED, 1);
+        tx_led_debounce = debounce_ticks;
+#endif
+    }
+
+    {
+#if DMA_OR_IRQ
+        /* 
+         * Check the amount of data received by the DMA, before the DMA transfer is complete.
+         * Even if DMA only partially transmits data, you need to add the transferred data to 
+         * ringbuf as soon as possible.
+         */
+        int dma_xfer_len = rx_dma_total - dma_channel_hw_addr(uart_rx_dma_ch)->transfer_count;
+        if(dma_xfer_len > 0){
+            irq_set_enabled(DMA_IRQ_0, false);
+            dma_xfer_len = rx_dma_total - dma_channel_hw_addr(uart_rx_dma_ch)->transfer_count;
+            if(dma_xfer_len > 0){
+                ringbuf_produce(&rx_ringbuf, dma_xfer_len);
+                rx_dma_total -= dma_xfer_len;
+            }
+            irq_set_enabled(DMA_IRQ_0, true);
+        }
+#endif
+
+        /* 
+         * Transfer the data from the ringbuf to the GUI and USB-CDC.
+         *
+         * USB-CDC when not connected can cause data blocking. To ensure that there is no effect 
+         * on the data output to the GUI, skip the process of outputting data to USB-CDC if there 
+         * is no buffer to write to USB-CDC for multiple times in a row.
+         */
+        const char* rx_buf;
+        int rx_buf_len;
+        irq_set_enabled(DMA_IRQ_0, false);
+        rx_buf = ringbuf_get_ptr(&rx_ringbuf, &rx_buf_len);
+        irq_set_enabled(DMA_IRQ_0, true);
+        if(rx_buf_len > 0){
+            static int cdc_block_times = 0;
+            int cdc_has_block = 0;
+
+            if(tud_ready()){
+                int cdc_buf_len = tud_cdc_n_write_available(CDC_INTERFACE);
+                if(cdc_buf_len == 0){
+                    cdc_block_times++;
+                    if(cdc_block_times > 20){
+                        cdc_has_block = 1;
+                    }
+                }else{
+                    cdc_block_times = 0;
+                }
+
+                if(cdc_has_block == 0 && rx_buf_len > cdc_buf_len){
+                    rx_buf_len = cdc_buf_len;
+                }
+            }
+
+            if(rx_buf_len > 0){
+                if(tud_ready() && cdc_has_block == 0){
+                    tud_cdc_n_write(CDC_INTERFACE, rx_buf, rx_buf_len);
+                    tud_cdc_n_write_flush(CDC_INTERFACE);
+                }
+
+#if DMA_OR_IRQ
+                irq_set_enabled(DMA_IRQ_0, false);
+                ringbuf_consume(&rx_ringbuf, rx_buf_len);
+                irq_set_enabled(DMA_IRQ_0, true);
+#else
+                ringbuf_consume(&rx_ringbuf, rx_buf_len);
+#endif
+                keep_alive = true;
+            }
+#ifdef PROBE_UART_RX_LED
+            gpio_put(PROBE_UART_RX_LED, 1);
+            rx_led_debounce = debounce_ticks;
+#endif
+        }
+
+#if DMA_OR_IRQ
+        /* 
+         * If the DMA transmission is complete and the DMA interrupt task has been processed, 
+         * you need to restart the data reception.
+         */
+        if(dma_channel_is_busy(uart_rx_dma_ch) == false){
+            irq_set_enabled(DMA_IRQ_0, false);
+            if(dma_channel_get_irq0_status(uart_rx_dma_ch) == false){
+                char* rx_buf = ringbuf_puts_ptr(&rx_ringbuf, (int*)&rx_dma_total);
+                if(rx_dma_total > 0)
+                    dma_channel_transfer_to_buffer_now(uart_rx_dma_ch, rx_buf, rx_dma_total);
+            }
+            irq_set_enabled(DMA_IRQ_0, true);
+        }
+#endif
+    }
+
+    return keep_alive;
+}
+
+static int uart_resetting;
+
+void cdc_thread(void *ptr)
+{
+    BaseType_t delayed;
+    last_wake = xTaskGetTickCount();
+    bool keep_alive;
+
+#if (configNUMBER_OF_CORES > 1)
+    vTaskCoreAffinitySet(NULL, 1 << 0);
+#endif
+
+    /* Threaded with a polling interval that scales according to linerate */
+    while (1) {
+        keep_alive = cdc_task();
+        if (!keep_alive) {
+            delayed = xTaskDelayUntil(&last_wake, interval);
+            if (delayed == pdFALSE)
+                last_wake = xTaskGetTickCount();
+        }
+
+        if(uart_resetting){
+            vTaskDelay(pdMS_TO_TICKS(50));
+            uart_resetting = 0;
+
+            cdc_uart_reinit();
+        }
+    }
+}
+
+void cdc_thread_create(void){
+    #define UART_TASK_PRIO 3
+    xTaskCreate(cdc_thread, "UART", configMINIMAL_STACK_SIZE, NULL, UART_TASK_PRIO, &uart_taskhandle);
+}
+
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* line_coding)
+{
+    if(itf != CDC_INTERFACE)
+        return;
+    uart_parity_t parity;
+    uint data_bits, stop_bits;
+
+    uint32_t micros = (1000 * 1000 * 128 * 10) / MAX(line_coding->bit_rate, 1);
+    /* Modifying state, so park the thread before changing it. */
+    if (uart_taskhandle != NULL)
+        vTaskSuspend(uart_taskhandle);
+    interval = MAX(1, pdMS_TO_TICKS(micros / 1000) / 2);
+    debounce_ticks = MAX(1, configTICK_RATE_HZ / (interval * DEBOUNCE_MS));
+    probe_info("New baud rate %ld micros %ld interval %lu\n",
+                                    line_coding->bit_rate, micros, interval);
+
+    new_baudrate = line_coding->bit_rate;
+    /* Keep the baud rate cache read by the GUI in sync so cdc_get_baudrate() does not return a stale value */
+    baudrate_save = new_baudrate;
+
+    switch (line_coding->parity) {
+    case CDC_LINE_CODING_PARITY_ODD:
+        parity = UART_PARITY_ODD;
+        break;
+    case CDC_LINE_CODING_PARITY_EVEN:
+        parity = UART_PARITY_EVEN;
+        break;
+    default:
+        probe_info("invalid parity setting %u\n", line_coding->parity);
+        /* fallthrough */
+    case CDC_LINE_CODING_PARITY_NONE:
+        parity = UART_PARITY_NONE;
+        break;
+    }
+
+    switch (line_coding->data_bits) {
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+        data_bits = line_coding->data_bits;
+        break;
+    default:
+        probe_info("invalid data bits setting: %u\n", line_coding->data_bits);
+        data_bits = 8;
+        break;
+    }
+
+    /* The PL011 only supports 1 or 2 stop bits. 1.5 stop bits is translated to 2,
+     * which is safer than the alternative. */
+    switch (line_coding->stop_bits) {
+    case CDC_LINE_CONDING_STOP_BITS_1_5:
+    case CDC_LINE_CONDING_STOP_BITS_2:
+        stop_bits = 2;
+    break;
+    default:
+        probe_info("invalid stop bits setting: %u\n", line_coding->stop_bits);
+        /* fallthrough */
+    case CDC_LINE_CONDING_STOP_BITS_1:
+        stop_bits = 1;
+    break;
+    }
+
+    new_data_bits = data_bits;
+    new_stop_bits = stop_bits;
+    new_parity = parity;
+    uart_resetting = 1;
+
+    if (uart_taskhandle != NULL)
+        vTaskResume(uart_taskhandle);
+}
+
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
+{
+    if(itf != CDC_INTERFACE)
+        return;
+#ifdef PROBE_UART_RTS
+    gpio_put(PROBE_UART_RTS, !rts);
+#endif
+#ifdef PROBE_UART_DTR
+    gpio_put(PROBE_UART_DTR, !dtr);
+#endif
+
+    /* CDC drivers use linestate as a bodge to activate/deactivate the interface.
+     * Resume our UART polling on activate, stop on deactivate */
+    if (!dtr && !rts) {
+#ifdef PROBE_UART_RX_LED
+        gpio_put(PROBE_UART_RX_LED, 0);
+        rx_led_debounce = 0;
+#endif
+#ifdef PROBE_UART_TX_LED
+        gpio_put(PROBE_UART_TX_LED, 0);
+        tx_led_debounce = 0;
+#endif
+    }
+}

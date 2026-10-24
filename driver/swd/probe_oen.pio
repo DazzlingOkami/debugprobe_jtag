@@ -1,0 +1,159 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) 2023 Raspberry Pi Ltd
+
+; Each TX FIFO entry is either a command or the data word following a command.
+; Command word layout:
+; | 31:12 | 11:7  | 6:0      |
+; | data  | entry | bits - 1 |
+; Short commands inline the data in [31:12], other commands take it from a second
+; FIFO entry. The entry address is loaded by "out pc, 5", the bit count by
+; "out x, 7" (value is bits - 1). jtag_tms_seq_* treat [11:7] and [31:12] as five
+; 5-bit entry addresses: each beat drives one TMS level and one TCK, "out pc"
+; chains to the next field, and the last field returns to get_next_cmd.
+
+.program probe
+.side_set 2 opt
+
+public turnaround_cmd:
+turnaround_bitloop:
+    nop                         [1]  side 0x0
+    jmp x-- turnaround_bitloop  [1]  side 0x1
+    jmp get_next_cmd
+
+public write_cmd:
+    pull
+public short_write_cmd:
+write_bitloop:
+    out pins, 1                 [1]  side 0x2   ; Data is output by host on negedge
+    jmp x-- write_bitloop       [1]  side 0x3   ; ...and captured by target on posedge
+                                                ; Fall through to next command
+.wrap_target
+public get_next_cmd:
+    pull                             side 0x0   ; SWCLK initially low, OEn disabled
+    out x, 7                                    ; Get bit count
+    out pc, 5                                   ; Go to command routine
+
+read_bitloop:
+    nop                                         ; Additional delay on taken loop branch
+public read_cmd:
+    in pins, 1                  [1]  side 0x1   ; Data is captured by host on posedge
+    jmp x-- read_bitloop             side 0x0
+    push
+    jmp get_next_cmd                            ; Fall through to next command
+
+; JTAG commands. TMS shares the SWD_DO pin (set pin group, base configured per mode
+; on the C side), TDI is driven by the out pin group (same base), TDO is sampled by
+; the in pin group. Sideset bit 1 = DOE must stay 1, otherwise the external buffer
+; goes high-Z and TMS cannot be driven.
+public jtag_tms_lo_cmd:
+    set pins, 0                      side 0x2   ; DOE=1, TCK=0
+    jmp get_next_cmd
+
+public jtag_tms_hi_cmd:
+    set pins, 1                      side 0x2
+    jmp get_next_cmd
+
+; TMS sequence: after "set", "out pc, 5" loads the entry address of the next beat
+; (a 5-bit field in the command word), so one FIFO command chains 1 to 4 beats of
+; "TMS + clock" without dispatching a command on every beat.
+public jtag_tms_seq_lo_cmd:
+    set pins, 0                 [1]  side 0x2   ; 2 cycles: TMS=0, TCK low
+    out pc, 5                   [1]  side 0x3   ; 2 cycles: load next entry, TCK high
+
+public jtag_tms_seq_hi_cmd:
+    set pins, 1                 [1]  side 0x2
+    out pc, 5                   [1]  side 0x3
+
+public jtag_rw_cmd:
+    pull                                        ; second FIFO word carries TDI data
+public jtag_rw_short_cmd:                       ; TDI inlined in command word [31:12]
+jtag_rw_bitloop:
+    out pins, 1                 [1]  side 0x2   ; 2 cycles: TCK low, shift out one TDI bit
+    in pins, 1                       side 0x3   ; 1 cycle: TCK high, sample TDO
+    jmp x-- jtag_rw_bitloop          side 0x2   ; 1 cycle: TCK low, gives TDO 3 cycles to settle
+    push
+.wrap
+
+
+; Implement probe_gpio_init() and probe_sm_init() methods here - set pins, offsets, sidesets etc
+% c-sdk {
+
+static inline void probe_gpio_init(PIO pio)
+{
+#if defined(PROBE_RESET_PIN)
+    // Target reset pin: pull up, input to emulate open drain pin
+    gpio_pull_up(PROBE_RESET_PIN);
+    // gpio_init will leave the pin cleared and set as input
+    gpio_init(PROBE_RESET_PIN);
+#endif
+#if defined(PROBE_JTAG_TRST_PIN)
+    gpio_pull_up(PROBE_JTAG_TRST_PIN);
+    gpio_init(PROBE_JTAG_TRST_PIN);
+    gpio_set_dir(PROBE_JTAG_TRST_PIN, GPIO_OUT);
+    gpio_put(PROBE_JTAG_TRST_PIN, 1);
+#endif
+
+    // Funcsel pins
+    pio_gpio_init(pio, PROBE_JTAG_TDO_PIN);
+    pio_gpio_init(pio, PROBE_SWD_CLK_PIN);
+    pio_gpio_init(pio, PROBE_SWD_DOE_PIN);
+    pio_gpio_init(pio, PROBE_SWD_DI_PIN);
+    pio_gpio_init(pio, PROBE_SWD_DO_PIN);
+
+    // Make sure SWDIO has a pullup on it. Idle state is high
+    gpio_pull_up(PROBE_SWD_DO_PIN);
+
+    // Disable input synchronizer to reduces input delay.
+    hw_set_bits(&pio->input_sync_bypass, 1u << PROBE_SWD_DI_PIN);
+    hw_set_bits(&pio->input_sync_bypass, 1u << PROBE_JTAG_TDO_PIN);
+}
+
+// DAP interface says all pins have to be High-Z when disabled
+static inline void probe_gpio_deinit()
+{
+#if defined(PROBE_RESET_PIN)
+    gpio_deinit(PROBE_RESET_PIN);
+    gpio_disable_pulls(PROBE_RESET_PIN);
+#endif
+#if defined(PROBE_JTAG_TRST_PIN)
+    gpio_deinit(PROBE_JTAG_TRST_PIN);
+    gpio_disable_pulls(PROBE_JTAG_TRST_PIN);
+#endif
+
+    gpio_deinit(PROBE_JTAG_TDI_PIN);
+    gpio_deinit(PROBE_JTAG_TDO_PIN);
+    gpio_deinit(PROBE_SWD_CLK_PIN);
+    gpio_deinit(PROBE_SWD_DOE_PIN);
+    gpio_deinit(PROBE_SWD_DI_PIN);
+    gpio_deinit(PROBE_SWD_DO_PIN);
+
+    gpio_disable_pulls(PROBE_SWD_DO_PIN);
+}
+
+static inline void probe_sm_init(PIO pio, pio_sm_config* sm_config) {
+    // Set CLK and DOE as sideset pins
+    sm_config_set_sideset_pins(sm_config, PROBE_SWD_CLK_PIN);
+
+    // Start with the SWD binding: sample SWD_DI, drive SWD_DO, set group covers TMS only
+    sm_config_set_in_pins(sm_config, PROBE_SWD_DI_PIN);
+    sm_config_set_out_pins(sm_config, PROBE_SWD_DO_PIN, 1);
+    sm_config_set_set_pins(sm_config, PROBE_SWD_DO_PIN, 1);
+
+    // Set SWDIOEN, SWD and SWDIO pins as output to start. This will be set in the sm
+#define PIO_SM_SET_PIN_OUTPUT(pin) pio_sm_set_pindirs_with_mask(pio, PROBE_SM, (1u << pin), (1u << pin))
+#define PIO_SM_SET_PIN_INPUT(pin)  pio_sm_set_pindirs_with_mask(pio, PROBE_SM, 0, (1u << pin))
+    // TDI is unused in SWD mode; probe_enter_swd() sets directions per mode
+    PIO_SM_SET_PIN_INPUT(PROBE_JTAG_TDI_PIN);
+    PIO_SM_SET_PIN_INPUT(PROBE_JTAG_TDO_PIN);
+    PIO_SM_SET_PIN_OUTPUT(PROBE_SWD_CLK_PIN);
+    PIO_SM_SET_PIN_OUTPUT(PROBE_SWD_DOE_PIN);
+    PIO_SM_SET_PIN_INPUT(PROBE_SWD_DI_PIN);
+    PIO_SM_SET_PIN_OUTPUT(PROBE_SWD_DO_PIN);
+
+    // shift output right, autopull off, autopull threshold
+    sm_config_set_out_shift(sm_config, true, false, 0);
+    // shift input right as swd data is lsb first, autopush off
+    sm_config_set_in_shift(sm_config, true, false, 0);
+}
+
+%}

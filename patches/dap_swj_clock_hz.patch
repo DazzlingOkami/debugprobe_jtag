@@ -1,0 +1,36 @@
+--- a/lib/CMSIS-DAP/Firmware/Source/DAP.c
++++ b/lib/CMSIS-DAP/Firmware/Source/DAP.c
+@@ -56,28 +56,11 @@
+ static const char DAP_FW_Ver [] = DAP_FW_VER;
+ 
+ 
+-// Common clock delay calculation routine
+-//   clock:    requested SWJ frequency in Hertz
+-static void Set_Clock_Delay(uint32_t clock) {
+-  uint32_t delay;
+-
+-  if (clock >= MAX_SWJ_CLOCK(DELAY_FAST_CYCLES)) {
+-    DAP_Data.fast_clock  = 1U;
+-    DAP_Data.clock_delay = 1U;
+-  } else {
+-    DAP_Data.fast_clock  = 0U;
+-
+-    delay = ((CPU_CLOCK/2U) + (clock - 1U)) / clock;
+-    if (delay > IO_PORT_WRITE_CYCLES) {
+-      delay -= IO_PORT_WRITE_CYCLES;
+-      delay  = (delay + (DELAY_SLOW_CYCLES - 1U)) / DELAY_SLOW_CYCLES;
+-    } else {
+-      delay  = 1U;
+-    }
+-
+-    DAP_Data.clock_delay = delay;
+-  }
+-}
++// Common clock setting routine
++//   clock:    requested SWJ frequency in Hertz
++static void Set_Clock_Delay(uint32_t clock) {
++  probe_set_swclk_freq_hz(clock);
++}
+ 
+ 
+ // Get DAP Information
