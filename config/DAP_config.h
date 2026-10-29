@@ -96,6 +96,11 @@ This information includes:
 /// setting can be reduced (valid range is 1 .. 255).
 #define DAP_PACKET_COUNT        8U              ///< Specifies number of packets buffered.
 
+/// Enable the endpoint throughput statistics read by vendor command 0x82.
+/// Adds counters and timestamp reads to the endpoint callback path; while disabled
+/// the command is rejected with ID_DAP_Invalid.
+#define DAP_STATS_ENABLE        0               ///< Statistics: 1 = compiled in, 0 = not compiled.
+
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
 #define SWO_UART                0               ///< SWO UART:  1 = available, 0 = not available.

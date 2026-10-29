@@ -8,12 +8,14 @@
 | --- | --- |
 | 硬件 | 目标板，RP2350A，已枚举为 CMSIS-DAP v2 |
 | 上位机 | 支持 `cmsis-dap cmd` 的 OpenOCD |
-| 固件 | `build/daplink.uf2` |
+| 固件 | `build/daplink.uf2`，由 `config/DAP_config.h` 中 `DAP_STATS_ENABLE = 1` 编译 |
 | 测试负载 | 一段可重复扫描的 SRAM 区域 |
 
 ## 2. 命令格式
 
 请求 `[0x82, sel]`，响应固定 5 字节 `[cmd, b0, b1, b2, b3]`，OpenOCD 打印后 4 字节。
+
+`DAP_STATS_ENABLE` 为 0 时该命令未编译，`0x82` 按未知命令返回单字节 `ff`。
 
 | `sel` | 用途 | 打印含义 |
 | --- | --- | --- |

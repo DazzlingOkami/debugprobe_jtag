@@ -334,7 +334,7 @@ OpenOCD 打印响应的第 1…4 字节，即 `vref_10x result mv_lo mv_hi`。�
 
 ### 6.7 端点统计（Vendor 命令 0x82）
 
-`module/dap/dap_stats.h` 声明统计接口，`tusb_edpt_handler.c` 在收发回调里维护计数，`dap_vendor.c` 把结果通过 `0x82`（`ID_DAP_Vendor2`）暴露给上位机，用于判断吞吐瓶颈在主机侧还是设备侧。
+`module/dap/dap_stats.h` 声明统计接口，`tusb_edpt_handler.c` 在收发回调里维护计数，`dap_vendor.c` 把结果通过 `0x82`（`ID_DAP_Vendor2`）暴露给上位机，用于判断吞吐瓶颈在主机侧还是设备侧。`config/DAP_config.h` 的 `DAP_STATS_ENABLE` 控制是否编译，默认关闭；关闭时 `0x82` 不进入统计分支，按未知命令返回 `ID_DAP_Invalid`。
 
 请求为 `[0x82, sel]`，响应固定 5 字节 `[cmd, b0, b1, b2, b3]`，OpenOCD 打印后 4 字节。
 

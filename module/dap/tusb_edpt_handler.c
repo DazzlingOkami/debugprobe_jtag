@@ -21,12 +21,14 @@ static buffer_t USBResponseBuffer;
 /* Serializes ring index updates and endpoint arming against the USB callbacks */
 static SemaphoreHandle_t edpt_mutex;
 
+#if DAP_STATS_ENABLE
 /* Throughput counters, all updates are done with edpt_mutex held */
 static dap_stats_t edpt_stats;
 
 /* Timestamp of the previous OUT completion, used for the gap statistics */
 static uint32_t last_out_us;
 static bool out_gap_valid;
+#endif
 
 #define WR_IDX(x) (x.wptr % DAP_BUFFER_COUNT)
 #define RD_IDX(x) (x.rptr % DAP_BUFFER_COUNT)
@@ -63,6 +65,7 @@ bool dap_edpt_deinit(void)
 	return true;
 }
 
+#if DAP_STATS_ENABLE
 /* Track the deepest ring occupancy seen, called with edpt_mutex held */
 static void stats_note_depth(uint8_t *max_depth, uint32_t depth)
 {
@@ -97,6 +100,7 @@ void dap_stats_reset(void)
 	out_gap_valid = false;
 	xSemaphoreGive(edpt_mutex);
 }
+#endif
 
 void dap_edpt_reset(uint8_t __unused rhport)
 {
@@ -168,8 +172,10 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 	USBResponseBuffer.wasFull = false;
 	USBRequestBuffer.wasFull = false;
 
+#if DAP_STATS_ENABLE
 	// Throughput counters start from zero for every new connection
 	dap_stats_reset();
+#endif
 
 	uint16_t const drv_len = sizeof(tusb_desc_interface_t) + (itf_desc->bNumEndpoints * sizeof(tusb_desc_endpoint_t));
 	TU_VERIFY(max_len >= drv_len, 0);
@@ -210,9 +216,11 @@ bool dap_edpt_control_xfer_cb(uint8_t __unused rhport, uint8_t stage, tusb_contr
 bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
 	const uint8_t ep_dir = tu_edpt_dir(ep_addr);
+#if DAP_STATS_ENABLE
 	uint32_t req_depth;
 	uint32_t now_us;
 	uint32_t gap_us;
+#endif
 
 	(void) result;
 
@@ -226,7 +234,9 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	if (ep_dir == TUSB_DIR_IN)
 	{
 		USBResponseBuffer.rptr++;
+#if DAP_STATS_ENABLE
 		edpt_stats.in_packets++;
+#endif
 
 		/* Chain the next queued response; the DAP thread only arms the first one */
 		if (USBResponseBuffer.rptr != USBResponseBuffer.wptr)
@@ -250,6 +260,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			USBRequestBuffer.wasFull = true;
 		}
 
+#if DAP_STATS_ENABLE
 		/* Record how many requests the host had queued at once */
 		req_depth = USBRequestBuffer.wptr - USBRequestBuffer.rptr;
 		if (USBRequestBuffer.wasFull)
@@ -277,6 +288,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 		}
 		last_out_us = now_us;
 		out_gap_valid = true;
+#endif
 	}
 	else
 	{
@@ -299,8 +311,10 @@ void dap_thread(void *ptr)
 {
 	uint32_t n;
 	uint32_t notified;
+#if DAP_STATS_ENABLE
 	uint32_t start_us;
 	uint32_t busy_us;
+#endif
 	uint16_t resp_len;
 	bool was_empty;
 
@@ -335,10 +349,14 @@ void dap_thread(void *ptr)
 			}
 
 			/* Process the request in place, the response goes to its own ring slot */
+#if DAP_STATS_ENABLE
 			start_us = time_us_32();
+#endif
 			resp_len = (uint16_t) DAP_ExecuteCommand(RD_SLOT_PTR(USBRequestBuffer),
 								 WR_SLOT_PTR(USBResponseBuffer));
+#if DAP_STATS_ENABLE
 			busy_us = time_us_32() - start_us;
+#endif
 			probe_info("%lu %lu DAP resp %s len %u\n",
 				       USBResponseBuffer.wptr, USBResponseBuffer.rptr,
 				       dap_cmd_name(WR_SLOT_PTR(USBResponseBuffer)[0]), resp_len);
@@ -351,6 +369,7 @@ void dap_thread(void *ptr)
 			USBResponseBuffer.wptr++;
 			USBRequestBuffer.rptr++;
 
+#if DAP_STATS_ENABLE
 			/* Track how much time the device spends inside the command */
 			edpt_stats.busy_us += busy_us;
 			if (busy_us > edpt_stats.max_busy_us)
@@ -361,6 +380,7 @@ void dap_thread(void *ptr)
 			/* Track the deepest response backlog (queued plus in flight) */
 			stats_note_depth(&edpt_stats.max_resp_depth,
 					 USBResponseBuffer.wptr - USBResponseBuffer.rptr);
+#endif
 
 			/* The OUT callback stops re-arming when the ring is full, resume here */
 			if (USBRequestBuffer.wasFull)

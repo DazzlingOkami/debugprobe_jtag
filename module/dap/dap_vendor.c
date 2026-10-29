@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "DAP_config.h"
 #include "DAP.h"
 #include "dac_mcp4716/mcp4716.h"
 #include "dap_stats.h"
@@ -40,6 +41,7 @@
 /* Response layout: [cmd, vref_10x, result, mv_lo, mv_hi] */
 #define DAP_VENDOR_RESP_LEN             (5U)
 
+#if DAP_STATS_ENABLE
 /* Statistics selector carried in the second request byte */
 #define DAP_VENDOR_STATS_DEPTH          (0U)    /**< Max/current ring depth */
 #define DAP_VENDOR_STATS_OUT            (1U)    /**< Completed OUT transfers */
@@ -57,6 +59,7 @@
 
 /* Statistics response layout: [cmd, b0, b1, b2, b3] */
 #define DAP_VENDOR_STATS_RESP_LEN       (5U)
+#endif
 
 /**
  * @brief  Build the common vendor response.
@@ -119,6 +122,7 @@ static uint32_t vref_get(uint8_t *response)
     return vref_response(DAP_VENDOR_CMD_VREF_GET, 1U, DAP_VENDOR_RESULT_OK, response);
 }
 
+#if DAP_STATS_ENABLE
 /**
  * @brief  Encode a 32-bit value as little-endian bytes.
  * @param  [out] dst   Destination, 4 bytes
@@ -205,6 +209,7 @@ static uint32_t stats_command(uint8_t sel, uint8_t *response)
 
     return (2U << 16) | DAP_VENDOR_STATS_RESP_LEN;
 }
+#endif
 
 /**
  * @brief  Process a DAP vendor command and prepare the response data.
@@ -221,8 +226,10 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
     case DAP_VENDOR_CMD_VREF_GET:
         return vref_get(response);
 
+#if DAP_STATS_ENABLE
     case DAP_VENDOR_CMD_STATS:
         return stats_command(request[1], response);
+#endif
 
     default:
         *response = ID_DAP_Invalid;

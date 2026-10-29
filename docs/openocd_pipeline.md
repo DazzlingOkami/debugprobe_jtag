@@ -119,7 +119,7 @@ err = libusb_bulk_transfer(dap->bdata->dev_handle, dap->bdata->ep_in,
 
 ## 5. 验证方法
 
-固件侧统计命令（`0x82`）可以直接确认改动是否生效：
+固件侧统计命令（`0x82`）可以直接确认改动是否生效。该功能默认不编译，需先在 `config/DAP_config.h` 中把 `DAP_STATS_ENABLE` 置 1：
 
 ```text
 cmsis-dap cmd 0x82 4   # 清零
