@@ -15,15 +15,20 @@
 #define DAP_INTERFACE_SUBCLASS 0x00
 #define DAP_INTERFACE_PROTOCOL 0x00
 
+/* Local ring slots. Twice the packet count advertised to the host: a full host
+ * window plus a queued-command terminator always fits, so the endpoint never
+ * has to NAK. Costs DAP_PACKET_COUNT * DAP_PACKET_SIZE bytes per direction. */
+#define DAP_BUFFER_COUNT (DAP_PACKET_COUNT * 2U)
+
 typedef struct {
-	uint8_t data[DAP_PACKET_COUNT][DAP_PACKET_SIZE];
+	uint8_t data[DAP_BUFFER_COUNT][DAP_PACKET_SIZE];
+	uint16_t data_len[DAP_BUFFER_COUNT];
 	volatile uint32_t wptr;
 	volatile uint32_t rptr;
-	volatile bool wasEmpty;
 	volatile bool wasFull;
 } buffer_t;
 
-extern TaskHandle_t dap_taskhandle, tud_taskhandle;
+extern TaskHandle_t dap_taskhandle;
 
 /* Main DAP loop */
 void dap_thread(void *ptr);

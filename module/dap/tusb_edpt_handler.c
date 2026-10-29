@@ -6,11 +6,11 @@
 
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
+#include "dap_stats.h"
+#include "semphr.h"
 
 static uint8_t itf_num;
 static uint8_t _rhport;
-
-volatile uint32_t _resp_len;
 
 static uint8_t _out_ep_addr;
 static uint8_t _in_ep_addr;
@@ -18,18 +18,28 @@ static uint8_t _in_ep_addr;
 static buffer_t USBRequestBuffer;
 static buffer_t USBResponseBuffer;
 
-static uint8_t DAPRequestBuffer[DAP_PACKET_SIZE];
-static uint8_t DAPResponseBuffer[DAP_PACKET_SIZE];
+/* Serializes ring index updates and endpoint arming against the USB callbacks */
+static SemaphoreHandle_t edpt_mutex;
 
-#define WR_IDX(x) (x.wptr % DAP_PACKET_COUNT)
-#define RD_IDX(x) (x.rptr % DAP_PACKET_COUNT)
+/* Throughput counters, all updates are done with edpt_mutex held */
+static dap_stats_t edpt_stats;
+
+/* Timestamp of the previous OUT completion, used for the gap statistics */
+static uint32_t last_out_us;
+static bool out_gap_valid;
+
+#define WR_IDX(x) (x.wptr % DAP_BUFFER_COUNT)
+#define RD_IDX(x) (x.rptr % DAP_BUFFER_COUNT)
 
 #define WR_SLOT_PTR(x) &(x.data[WR_IDX(x)][0])
 #define RD_SLOT_PTR(x) &(x.data[RD_IDX(x)][0])
 
+/* wptr/rptr are free-running counters, so compare slot indices instead of raw
+ * values. 2^32 is a multiple of DAP_BUFFER_COUNT, which keeps the index valid
+ * across counter wrap. */
 bool buffer_full(buffer_t *buffer)
 {
-	return ((buffer->wptr + 1) % DAP_PACKET_COUNT == buffer->rptr);
+	return (((buffer->wptr + 1U) % DAP_BUFFER_COUNT) == (buffer->rptr % DAP_BUFFER_COUNT));
 }
 
 bool buffer_empty(buffer_t *buffer)
@@ -37,17 +47,55 @@ bool buffer_empty(buffer_t *buffer)
 	return (buffer->wptr == buffer->rptr);
 }
 
-void dap_edpt_init(void) {
-
+void dap_edpt_init(void)
+{
+	edpt_mutex = xSemaphoreCreateMutex();
 }
 
 bool dap_edpt_deinit(void)
 {
-	memset(DAPRequestBuffer, 0, sizeof(DAPRequestBuffer));
-	memset(DAPResponseBuffer, 0, sizeof(DAPResponseBuffer));
-	USBRequestBuffer.wptr = USBRequestBuffer.rptr = 0;
-	USBResponseBuffer.wptr = USBResponseBuffer.rptr = 0;
+	memset(&USBRequestBuffer, 0, sizeof(USBRequestBuffer));
+	memset(&USBResponseBuffer, 0, sizeof(USBResponseBuffer));
+	if (edpt_mutex != NULL) {
+		vSemaphoreDelete(edpt_mutex);
+		edpt_mutex = NULL;
+	}
 	return true;
+}
+
+/* Track the deepest ring occupancy seen, called with edpt_mutex held */
+static void stats_note_depth(uint8_t *max_depth, uint32_t depth)
+{
+	if (depth > *max_depth) {
+		*max_depth = (uint8_t) depth;
+	}
+}
+
+void dap_stats_get(dap_stats_t *stats)
+{
+	xSemaphoreTake(edpt_mutex, portMAX_DELAY);
+
+	*stats = edpt_stats;
+	stats->uptime_ms = (uint32_t) xTaskGetTickCount();
+	stats->swclk_khz = (uint32_t) probe_get_swclk_freq();
+	stats->req_depth = (uint8_t) (USBRequestBuffer.wptr - USBRequestBuffer.rptr);
+	stats->resp_depth = (uint8_t) (USBResponseBuffer.wptr - USBResponseBuffer.rptr);
+
+	xSemaphoreGive(edpt_mutex);
+}
+
+void dap_stats_reset(void)
+{
+	if (edpt_mutex == NULL) {
+		memset(&edpt_stats, 0, sizeof(edpt_stats));
+		out_gap_valid = false;
+		return;
+	}
+
+	xSemaphoreTake(edpt_mutex, portMAX_DELAY);
+	memset(&edpt_stats, 0, sizeof(edpt_stats));
+	out_gap_valid = false;
+	xSemaphoreGive(edpt_mutex);
 }
 
 void dap_edpt_reset(uint8_t __unused rhport)
@@ -118,9 +166,10 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 
 	// Initialse full/empty flags
 	USBResponseBuffer.wasFull = false;
-	USBResponseBuffer.wasEmpty = true;
 	USBRequestBuffer.wasFull = false;
-	USBRequestBuffer.wasEmpty = true;
+
+	// Throughput counters start from zero for every new connection
+	dap_stats_reset();
 
 	uint16_t const drv_len = sizeof(tusb_desc_interface_t) + (itf_desc->bNumEndpoints * sizeof(tusb_desc_endpoint_t));
 	TU_VERIFY(max_len >= drv_len, 0);
@@ -157,142 +206,179 @@ bool dap_edpt_control_xfer_cb(uint8_t __unused rhport, uint8_t stage, tusb_contr
 	return false;
 }
 
-// Manage USBResponseBuffer (request) write and USBRequestBuffer (response) read indices
+// Manage USBResponseBuffer (response) write and USBRequestBuffer (request) read indices
 bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
 	const uint8_t ep_dir = tu_edpt_dir(ep_addr);
+	uint32_t req_depth;
+	uint32_t now_us;
+	uint32_t gap_us;
 
-	if(ep_dir == TUSB_DIR_IN)
+	(void) result;
+
+	if (xferred_bytes > DAP_PACKET_SIZE)
 	{
-		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
-		{
-			USBResponseBuffer.rptr++;
-
-			/* This checks that the buffer was not empty in DAP thread, which means the next buffer was not queued up
-			 * for the in endpoint callback */
-			// So, queue up the buffer at the new read index, since we expect read to catch up to write at this point.
-			/* It is possible for the read index to be multiple spaces behind the write index (if the USB callbacks
-			 * are lagging behind dap thread), */
-			// so we account for this by only setting wasEmpty to true if the next callback will empty the buffer
-			if(!USBResponseBuffer.wasEmpty)
-			{
-				usbd_edpt_xfer(rhport, ep_addr, RD_SLOT_PTR(USBResponseBuffer), (uint16_t) _resp_len);
-				USBResponseBuffer.wasEmpty = (USBResponseBuffer.rptr + 1) == USBResponseBuffer.wptr;
-			}
-
-			//  Wake up DAP thread after processing the callback
-			if(dap_taskhandle != NULL)
-			{
-				vTaskResume(dap_taskhandle);
-			}
-			return true;
-		}
-
-		return false;
-
-	} else if(ep_dir == TUSB_DIR_OUT)    {
-
-		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
-		{
-			// Only queue the next buffer in the out callback if the buffer is not full
-			// If full, we set the wasFull flag, which will be checked by dap thread
-			if(!buffer_full(&USBRequestBuffer))
-			{
-				USBRequestBuffer.wptr++;
-				usbd_edpt_xfer(rhport, ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
-				USBRequestBuffer.wasFull = false;
-			}
-			else {
-				USBRequestBuffer.wasFull = true;
-			}
-
-			//  Wake up DAP thread after processing the callback
-			if(dap_taskhandle != NULL)
-			{
-				vTaskResume(dap_taskhandle);
-			}
-			return true;
-		}
-
 		return false;
 	}
-	else return false;
+
+	xSemaphoreTake(edpt_mutex, portMAX_DELAY);
+
+	if (ep_dir == TUSB_DIR_IN)
+	{
+		USBResponseBuffer.rptr++;
+		edpt_stats.in_packets++;
+
+		/* Chain the next queued response; the DAP thread only arms the first one */
+		if (USBResponseBuffer.rptr != USBResponseBuffer.wptr)
+		{
+			usbd_edpt_xfer(rhport, ep_addr, RD_SLOT_PTR(USBResponseBuffer),
+				       USBResponseBuffer.data_len[RD_IDX(USBResponseBuffer)]);
+		}
+	}
+	else if (ep_dir == TUSB_DIR_OUT)
+	{
+		/* Only queue the next buffer if the ring is not full; otherwise the DAP
+		 * thread re-arms the endpoint once it has consumed a packet */
+		if (!buffer_full(&USBRequestBuffer))
+		{
+			USBRequestBuffer.wptr++;
+			usbd_edpt_xfer(rhport, ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
+			USBRequestBuffer.wasFull = false;
+		}
+		else
+		{
+			USBRequestBuffer.wasFull = true;
+		}
+
+		/* Record how many requests the host had queued at once */
+		req_depth = USBRequestBuffer.wptr - USBRequestBuffer.rptr;
+		if (USBRequestBuffer.wasFull)
+		{
+			/* The completed packet is in the ring but not counted yet */
+			req_depth++;
+		}
+
+		edpt_stats.out_packets++;
+		stats_note_depth(&edpt_stats.max_req_depth, req_depth);
+
+		/* Time between consecutive requests shows how the host paces packets */
+		now_us = time_us_32();
+		if (out_gap_valid)
+		{
+			gap_us = now_us - last_out_us;
+			if ((edpt_stats.min_out_gap_us == 0) || (gap_us < edpt_stats.min_out_gap_us))
+			{
+				edpt_stats.min_out_gap_us = gap_us;
+			}
+			if (gap_us > edpt_stats.max_out_gap_us)
+			{
+				edpt_stats.max_out_gap_us = gap_us;
+			}
+		}
+		last_out_us = now_us;
+		out_gap_valid = true;
+	}
+	else
+	{
+		xSemaphoreGive(edpt_mutex);
+		return false;
+	}
+
+	xSemaphoreGive(edpt_mutex);
+
+	/* Wake the DAP thread, there is either a new request or a free response slot */
+	if (dap_taskhandle != NULL)
+	{
+		xTaskNotify(dap_taskhandle, 0, eNoAction);
+	}
+
+	return true;
 }
 
 void dap_thread(void *ptr)
 {
 	uint32_t n;
-	do
+	uint32_t notified;
+	uint32_t start_us;
+	uint32_t busy_us;
+	uint16_t resp_len;
+	bool was_empty;
+
+	for (;;)
 	{
-		while(USBRequestBuffer.rptr != USBRequestBuffer.wptr)
+		/* Sleep until a USB callback queued a request or freed a response slot */
+		xTaskNotifyWait(0, 0xFFFFFFFFu, &notified, 1);
+
+		while (USBRequestBuffer.rptr != USBRequestBuffer.wptr)
 		{
 			/*
 			 * Atomic command support - buffer QueueCommands, but don't process them
 			 * until a non-QueueCommands packet is seen.
 			 */
 			n = USBRequestBuffer.rptr;
-			while (USBRequestBuffer.data[n % DAP_PACKET_COUNT][0] == ID_DAP_QueueCommands) {
+			while (USBRequestBuffer.data[n % DAP_BUFFER_COUNT][0] == ID_DAP_QueueCommands) {
 				probe_info("%lu %lu DAP queued cmd %s len %02x\n",
 					       USBRequestBuffer.wptr, USBRequestBuffer.rptr,
-					       dap_cmd_name(USBRequestBuffer.data[n % DAP_PACKET_COUNT][0]), USBRequestBuffer.data[n % DAP_PACKET_COUNT][1]);
-				USBRequestBuffer.data[n % DAP_PACKET_COUNT][0] = ID_DAP_ExecuteCommands;
+					       dap_cmd_name(USBRequestBuffer.data[n % DAP_BUFFER_COUNT][0]),
+					       USBRequestBuffer.data[n % DAP_BUFFER_COUNT][1]);
+				USBRequestBuffer.data[n % DAP_BUFFER_COUNT][0] = ID_DAP_ExecuteCommands;
 				n++;
 				while (n == USBRequestBuffer.wptr) {
-					/* Need yield in a loop here, as IN callbacks will also wake the thread */
-					probe_info("DAP wait\n");
-					/* Suspend this task itself instead of relying on dap_taskhandle */
-					vTaskSuspend(NULL);
+					/* The rest of the batch has not arrived yet */
+					xTaskNotifyWait(0, 0xFFFFFFFFu, &notified, 1);
 				}
 			}
-			// Read a single packet from the USB buffer into the DAP Request buffer
-			memcpy(DAPRequestBuffer, RD_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
-			probe_info("%lu %lu DAP cmd %s len %02x\n",
-				       USBRequestBuffer.wptr, USBRequestBuffer.rptr,
-				       dap_cmd_name(DAPRequestBuffer[0]), DAPRequestBuffer[1]);
+
+			/* Never overwrite a response the host has not read yet */
+			while (buffer_full(&USBResponseBuffer)) {
+				xTaskNotifyWait(0, 0xFFFFFFFFu, &notified, 1);
+			}
+
+			/* Process the request in place, the response goes to its own ring slot */
+			start_us = time_us_32();
+			resp_len = (uint16_t) DAP_ExecuteCommand(RD_SLOT_PTR(USBRequestBuffer),
+								 WR_SLOT_PTR(USBResponseBuffer));
+			busy_us = time_us_32() - start_us;
+			probe_info("%lu %lu DAP resp %s len %u\n",
+				       USBResponseBuffer.wptr, USBResponseBuffer.rptr,
+				       dap_cmd_name(WR_SLOT_PTR(USBResponseBuffer)[0]), resp_len);
+
+			xSemaphoreTake(edpt_mutex, portMAX_DELAY);
+
+			was_empty = buffer_empty(&USBResponseBuffer);
+
+			USBResponseBuffer.data_len[WR_IDX(USBResponseBuffer)] = resp_len;
+			USBResponseBuffer.wptr++;
 			USBRequestBuffer.rptr++;
 
-			/* If the buffer was full in the out callback, we need to queue up another buffer for the endpoint to consume,
-			 * now that we know there is space in the buffer. */
-			if(USBRequestBuffer.wasFull)
+			/* Track how much time the device spends inside the command */
+			edpt_stats.busy_us += busy_us;
+			if (busy_us > edpt_stats.max_busy_us)
 			{
-				vTaskSuspendAll(); // Suspend the scheduler to safely update the write index
+				edpt_stats.max_busy_us = busy_us;
+			}
+
+			/* Track the deepest response backlog (queued plus in flight) */
+			stats_note_depth(&edpt_stats.max_resp_depth,
+					 USBResponseBuffer.wptr - USBResponseBuffer.rptr);
+
+			/* The OUT callback stops re-arming when the ring is full, resume here */
+			if (USBRequestBuffer.wasFull)
+			{
 				USBRequestBuffer.wptr++;
 				usbd_edpt_xfer(_rhport, _out_ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
 				USBRequestBuffer.wasFull = false;
-				xTaskResumeAll();
 			}
 
-			_resp_len = DAP_ExecuteCommand(DAPRequestBuffer, DAPResponseBuffer);
-			probe_info("%lu %lu DAP resp %s\n",
-					USBResponseBuffer.wptr, USBResponseBuffer.rptr,
-					dap_cmd_name(DAPResponseBuffer[0]));
-
-
-			//  Suspend the scheduler to avoid stale values/race conditions between threads
-			vTaskSuspendAll();
-
-			if(buffer_empty(&USBResponseBuffer))
+			if (was_empty)
 			{
-				memcpy(WR_SLOT_PTR(USBResponseBuffer), DAPResponseBuffer, (uint16_t) _resp_len);
-				USBResponseBuffer.wptr++;
-
-				usbd_edpt_xfer(_rhport, _in_ep_addr, RD_SLOT_PTR(USBResponseBuffer), (uint16_t) _resp_len);
-			} else {
-
-				memcpy(WR_SLOT_PTR(USBResponseBuffer), DAPResponseBuffer, (uint16_t) _resp_len);
-				USBResponseBuffer.wptr++;
-
-				// The In callback needs to check this flag to know when to queue up the next buffer.
-				USBResponseBuffer.wasEmpty = false;
+				usbd_edpt_xfer(_rhport, _in_ep_addr, RD_SLOT_PTR(USBResponseBuffer),
+					       USBResponseBuffer.data_len[RD_IDX(USBResponseBuffer)]);
 			}
-			xTaskResumeAll();
+
+			xSemaphoreGive(edpt_mutex);
 		}
-
-		// Suspend DAP thread until it is awoken by a USB thread callback
-		vTaskSuspend(NULL);
-
-	} while (1);
-
+	}
 }
 
 usbd_class_driver_t const _dap_edpt_driver =

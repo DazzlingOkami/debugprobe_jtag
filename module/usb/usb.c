@@ -8,8 +8,32 @@
 #define TUD_TASK_PRIO 2
 #define DAP_TASK_PRIO 3
 
+static TaskHandle_t usb_taskhandle;
+
+/* TinyUSB queues an event from the USB interrupt; wake usb_thread right away so a
+ * transfer callback is not delayed until the next tick */
+void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
+{
+    (void) rhport;
+    (void) eventid;
+
+    if (usb_taskhandle == NULL) {
+        return;
+    }
+
+    if (in_isr) {
+        BaseType_t woken = pdFALSE;
+        xTaskNotifyFromISR(usb_taskhandle, 0, eNoAction, &woken);
+        portYIELD_FROM_ISR(woken);
+    } else {
+        xTaskNotify(usb_taskhandle, 0, eNoAction);
+    }
+}
+
 static void usb_thread(void *p)
 {
+    uint32_t notified;
+
 #if (configNUMBER_OF_CORES > 1)
     vTaskCoreAffinitySet(NULL, 1 << 0);
 #endif
@@ -18,6 +42,8 @@ static void usb_thread(void *p)
     gpio_init(PROBE_USB_CONNECTED_LED);
     gpio_set_dir(PROBE_USB_CONNECTED_LED, GPIO_OUT);
 #endif
+
+    usb_taskhandle = xTaskGetCurrentTaskHandle();
 
     TickType_t wake;
     wake = xTaskGetTickCount();
@@ -32,9 +58,9 @@ static void usb_thread(void *p)
         // If suspended or disconnected, delay for 1ms (20 ticks)
         if (tud_suspended() || !tud_connected())
             xTaskDelayUntil(&wake, pdMS_TO_TICKS(1));
-        // Go to sleep for up to a tick if nothing to do
+        // Go to sleep until TinyUSB queues another event
         else if (!tud_task_event_ready())
-            xTaskDelayUntil(&wake, 1);
+            xTaskNotifyWait(0, 0xFFFFFFFFu, &notified, 1);
     } while (1);
 }
 

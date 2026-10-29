@@ -17,10 +17,12 @@
 
 #include "DAP.h"
 #include "dac_mcp4716/mcp4716.h"
+#include "dap_stats.h"
 
 /* Command IDs; OpenOCD sends them as "cmsis-dap cmd 0x80 <value>" */
 #define DAP_VENDOR_CMD_VREF_SET         ID_DAP_Vendor0
 #define DAP_VENDOR_CMD_VREF_GET         ID_DAP_Vendor1
+#define DAP_VENDOR_CMD_STATS            ID_DAP_Vendor2
 
 /* Accepted voltage range in 0.1 V units; 0 is handled separately as "output off" */
 #define DAP_VENDOR_VREF_MIN_DV          (12U)
@@ -37,6 +39,24 @@
 
 /* Response layout: [cmd, vref_10x, result, mv_lo, mv_hi] */
 #define DAP_VENDOR_RESP_LEN             (5U)
+
+/* Statistics selector carried in the second request byte */
+#define DAP_VENDOR_STATS_DEPTH          (0U)    /**< Max/current ring depth */
+#define DAP_VENDOR_STATS_OUT            (1U)    /**< Completed OUT transfers */
+#define DAP_VENDOR_STATS_IN             (2U)    /**< Completed IN transfers */
+#define DAP_VENDOR_STATS_UPTIME         (3U)    /**< Tick counter in ms */
+#define DAP_VENDOR_STATS_RESET          (4U)    /**< Clear all counters */
+#define DAP_VENDOR_STATS_BUSY           (5U)    /**< Total command execution time in us */
+#define DAP_VENDOR_STATS_MAX_BUSY       (6U)    /**< Longest command execution in us */
+#define DAP_VENDOR_STATS_MIN_GAP        (7U)    /**< Shortest request interval in us */
+#define DAP_VENDOR_STATS_MAX_GAP        (8U)    /**< Longest request interval in us */
+#define DAP_VENDOR_STATS_SWCLK          (9U)    /**< Actual SWCLK in kHz */
+
+/* Returned in the first data byte for an unknown selector */
+#define DAP_VENDOR_STATS_INVALID        (0xFFU)
+
+/* Statistics response layout: [cmd, b0, b1, b2, b3] */
+#define DAP_VENDOR_STATS_RESP_LEN       (5U)
 
 /**
  * @brief  Build the common vendor response.
@@ -100,6 +120,93 @@ static uint32_t vref_get(uint8_t *response)
 }
 
 /**
+ * @brief  Encode a 32-bit value as little-endian bytes.
+ * @param  [out] dst   Destination, 4 bytes
+ * @param  [in]  value Value to encode
+ */
+static void put_u32_le(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFU);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFU);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFU);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+
+/**
+ * @brief  Handle the endpoint statistics command.
+ * @param  [in]  sel      Selector: depth, counters, uptime or reset
+ * @param  [out] response Response buffer, at least DAP_VENDOR_STATS_RESP_LEN bytes
+ * @return Request and response length
+ */
+static uint32_t stats_command(uint8_t sel, uint8_t *response)
+{
+    dap_stats_t stats;
+
+    response[0] = DAP_VENDOR_CMD_STATS;
+
+    if (sel == DAP_VENDOR_STATS_RESET) {
+        dap_stats_reset();
+        response[1] = 0;
+        response[2] = 0;
+        response[3] = 0;
+        response[4] = 0;
+        return (2U << 16) | DAP_VENDOR_STATS_RESP_LEN;
+    }
+
+    dap_stats_get(&stats);
+
+    switch (sel) {
+    case DAP_VENDOR_STATS_DEPTH:
+        response[1] = stats.max_req_depth;
+        response[2] = stats.max_resp_depth;
+        response[3] = stats.req_depth;
+        response[4] = stats.resp_depth;
+        break;
+
+    case DAP_VENDOR_STATS_OUT:
+        put_u32_le(&response[1], stats.out_packets);
+        break;
+
+    case DAP_VENDOR_STATS_IN:
+        put_u32_le(&response[1], stats.in_packets);
+        break;
+
+    case DAP_VENDOR_STATS_UPTIME:
+        put_u32_le(&response[1], stats.uptime_ms);
+        break;
+
+    case DAP_VENDOR_STATS_BUSY:
+        put_u32_le(&response[1], stats.busy_us);
+        break;
+
+    case DAP_VENDOR_STATS_MAX_BUSY:
+        put_u32_le(&response[1], stats.max_busy_us);
+        break;
+
+    case DAP_VENDOR_STATS_MIN_GAP:
+        put_u32_le(&response[1], stats.min_out_gap_us);
+        break;
+
+    case DAP_VENDOR_STATS_MAX_GAP:
+        put_u32_le(&response[1], stats.max_out_gap_us);
+        break;
+
+    case DAP_VENDOR_STATS_SWCLK:
+        put_u32_le(&response[1], stats.swclk_khz);
+        break;
+
+    default:
+        response[1] = DAP_VENDOR_STATS_INVALID;
+        response[2] = 0;
+        response[3] = 0;
+        response[4] = 0;
+        break;
+    }
+
+    return (2U << 16) | DAP_VENDOR_STATS_RESP_LEN;
+}
+
+/**
  * @brief  Process a DAP vendor command and prepare the response data.
  * @param  [in]  request  Pointer to the request data
  * @param  [out] response Pointer to the response data
@@ -113,6 +220,9 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
 
     case DAP_VENDOR_CMD_VREF_GET:
         return vref_get(response);
+
+    case DAP_VENDOR_CMD_STATS:
+        return stats_command(request[1], response);
 
     default:
         *response = ID_DAP_Invalid;

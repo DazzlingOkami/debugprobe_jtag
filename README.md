@@ -66,6 +66,8 @@ cmake --build build -j8
 
 - MCP4716A0 参考电压驱动：[docs/test_mcp4716.md](docs/test_mcp4716.md)
 - VREF Vendor 命令：[docs/test_vref_cmd.md](docs/test_vref_cmd.md)
+- 端点统计 Vendor 命令：[docs/test_stats_cmd.md](docs/test_stats_cmd.md)
+- OpenOCD v2 流水线缺陷与优化：[docs/openocd_pipeline.md](docs/openocd_pipeline.md)
 - SWJ 时钟频率：[docs/test_swj_clock.md](docs/test_swj_clock.md)
 - JTAG 实测步骤与判读：[docs/jtag_diag_plan.md](docs/jtag_diag_plan.md)
 - 状态指示灯与 `DAP_Info` 字符串：[docs/test_led_dap_info.md](docs/test_led_dap_info.md)

@@ -92,7 +92,7 @@
 | `bsp/` | `pico_sdk_import.cmake`，Pico SDK 引入 |
 | `config/` | `dap_board.h` 板级宏、`DAP_config.h` CMSIS-DAP 适配层、`FreeRTOSConfig.h`、`tusb_config.h` |
 | `driver/` | 与芯片外设直接交互的底层驱动：`swd`（PIO 位流）、`iic_shard`（IIC1 总线互斥）、`dac_mcp4716`（参考电压 DAC）、`uart`（CDC 桥）。`CMakeLists.txt` 用 `file(GLOB driver/*/*.c)` 收集 |
-| `module/dap/` | DAP 端点处理与 PIO 适配：`tusb_edpt_handler.c`、`sw_dp_pio.c`、`jtag_dp_pio.c`、`dap_vendor.c`、`dap_pio.h` |
+| `module/dap/` | DAP 端点处理与 PIO 适配：`tusb_edpt_handler.c`、`sw_dp_pio.c`、`jtag_dp_pio.c`、`dap_vendor.c`、`dap_stats.h`、`dap_pio.h` |
 | `lib/` | 第三方与上游代码：CMSIS-DAP Firmware、CMSIS_6、FreeRTOS-Kernel |
 | `module/` | 与硬件弱相关的功能模块：USB、DAP 端点、UART 桥、日志、工具 |
 | `tools/picotool` | Windows 下预置的 picotool 安装，避免联网下载 |
@@ -172,28 +172,36 @@ DAP 线程不在此创建，而是在 USB 挂载回调 `tud_mount_cb()` 中创�
 
 `module/dap/tusb_edpt_handler.c` 以自定义 TinyUSB 类驱动（`usbd_app_driver_get_cb()`）的形式接入，`dap_edpt_open()` 校验接口的 Class/SubClass/Protocol 全为 0 后打开两个 Bulk 端点。
 
-双向各维护一个环形缓冲区 `buffer_t`（`DAP_PACKET_COUNT` 个槽位，每槽 `DAP_PACKET_SIZE` 字节）：
+双向各维护一个环形缓冲区 `buffer_t`。本地槽位数是 `DAP_BUFFER_COUNT`（= 2 × `DAP_PACKET_COUNT`，即 16），上报给主机的仍是 `DAP_PACKET_COUNT`（8）；这样主机把 8 个包全部排满、再加一个批量终止包也放得下，端点不需要 NAK。
 
 ```c
+#define DAP_BUFFER_COUNT (DAP_PACKET_COUNT * 2U)
+
 typedef struct {
-    uint8_t data[DAP_PACKET_COUNT][DAP_PACKET_SIZE];
+    uint8_t data[DAP_BUFFER_COUNT][DAP_PACKET_SIZE];
+    uint16_t data_len[DAP_BUFFER_COUNT];
     volatile uint32_t wptr;
     volatile uint32_t rptr;
-    volatile bool wasEmpty;
     volatile bool wasFull;
 } buffer_t;
 ```
 
+`data_len` 记录每个响应槽的实际长度，IN 回调按槽重新投递，因此多个响应可以同时在途。
+
 数据流与流控要点：
 
 - **OUT 方向**：`dap_edpt_xfer_cb` 在每次搬运完成后，若缓冲未满就立即补发 `usbd_edpt_xfer()`；若已满则只置 `wasFull`，由 DAP 线程消费后补发。
-- **IN 方向**：DAP 线程在响应缓冲为空时直接投递响应；否则只写入并清 `wasEmpty`，由 IN 回调链式补发，以避免与回调竞争。
-- 两侧回调都会 `vTaskResume(dap_taskhandle)` 唤醒 DAP 线程；DAP 线程处理完排队数据后 `vTaskSuspend(NULL)` 自挂起。
-- DAP 线程在访问环形缓冲索引前用 `vTaskSuspendAll()`/`xTaskResumeAll()` 保护临界区。
+- **IN 方向**：DAP 线程只投递队首响应，后续响应由 IN 回调在每次完成后链式补发（`rptr != wptr` 表示仍有待发响应），从而支持多包连续发送。
+- **流控**：DAP 线程在写响应槽前等待 `buffer_full()` 解除，不会覆盖主机尚未读取的响应。
+- 两侧回调通过 `xTaskNotify()` 唤醒阻塞在 `xTaskNotifyWait()` 的 DAP 线程，DAP 线程不再自挂起。
+- 环形缓冲索引的读写和端点投递由互斥量 `edpt_mutex` 保护，适配双核 SMP。
+- 请求在其槽内直接处理，响应直接写入响应槽，省去中间拷贝。
+- 端点处理同时统计收发包数和环形深度峰值，通过 Vendor 命令 `0x82` 读取（见 §6.7）。
+- 主机能否用满这些槽位取决于上位机自身的排队策略，OpenOCD v2 后端的问题与优化见 `docs/openocd_pipeline.md`。
 
 ### 5.3 原子命令（QueueCommands）
 
-DAP 线程识别 `ID_DAP_QueueCommands` 开头的报文，将其就地改写为 `ID_DAP_ExecuteCommands` 并向后扫描，直到遇到非 Queue 命令才整体交给 `DAP_ExecuteCommand()` 处理。这实现了 CMSIS-DAP 的原子命令序列语义；若后续报文尚未到达，则 `vTaskSuspend(NULL)` 等待 USB 回调唤醒。
+DAP 线程识别 `ID_DAP_QueueCommands` 开头的报文，将其就地改写为 `ID_DAP_ExecuteCommands` 并向后扫描，直到遇到非 Queue 命令才整体交给 `DAP_ExecuteCommand()` 处理。这实现了 CMSIS-DAP 的原子命令序列语义；若后续报文尚未到达，则在 `xTaskNotifyWait()` 中等待 USB 回调唤醒。
 
 ### 5.4 USB 挂载/卸载
 
@@ -203,13 +211,13 @@ DAP 线程识别 `ID_DAP_QueueCommands` 开头的报文，将其就地改写为 
 | `tud_unmount_cb` | 挂起并删除 DAP 线程，句柄置空 |
 | `tud_suspend_cb` / `tud_resume_cb` | 挂起/恢复 DAP 线程，句柄为空时跳过 |
 
-`usb_thread` 轮询 `tud_task()`；未连接或已挂起时按 1 ms 延时，其余情况在无事件时让出 1 个 tick。
+`usb_thread` 调用 `tud_task()` 处理事件；未连接或已挂起时按 1 ms 延时，其余情况用 `xTaskNotifyWait()` 休眠。TinyUSB 在事件入队时调用 `tud_event_hook_cb()`（ISR 与任务上下文分别走 `xTaskNotifyFromISR()` 和 `xTaskNotify()`），USB 线程被立即唤醒，端点回调不会再被 1 ms 的 tick 延迟。
 
 ## 6. DAP 协议层
 
 ### 6.1 上游代码复用方式
 
-`lib/CMSIS-DAP` 为 ARM 官方参考实现，本项目按原样编译 `DAP.c`、`SWO.c`，**不修改上游源码**。
+`lib/CMSIS-DAP` 为 ARM 官方参考实现，本项目不修改该子模块：`DAP.c` 的本地适配在构建目录生成副本后再编译（见 §6.3），`SWO.c` 按原样编译。
 上游的 `SW_DP.c`、`JTAG_DP.c`、`DAP_vendor.c` 不参与编译，改由 `module/dap/` 提供同名实现：
 
 - `SW_DP.c` → `sw_dp_pio.c`：提供 `SWJ_Sequence()`、`SWD_Sequence()`、`SWD_Transfer()`，把逐位 GPIO 翻转替换为 PIO 命令投递。
@@ -239,7 +247,7 @@ DAP 线程识别 `ID_DAP_QueueCommands` 开头的报文，将其就地改写为 
 | `DAP_DEFAULT_PORT` | 1 | 默认 SWD |
 | `DAP_DEFAULT_SWJ_CLOCK` | 1 MHz | 默认调试时钟 |
 | `CPU_CLOCK` | 150 MHz | 与 `clk_sys` 一致，供 `Delayms()` / `DAP_Delay()` 换算忙等次数 |
-| `DAP_PACKET_SIZE` / `COUNT` | 64 / 2 | 单包 64 字节，双缓冲 |
+| `DAP_PACKET_SIZE` / `COUNT` | 64 / 8 | 单包 64 字节，上报 8 个包；本地环形 16 槽（`DAP_BUFFER_COUNT`） |
 | `SWO_UART` / `SWO_MANCHESTER` | 0 / 0 | SWO 未启用 |
 | `DAP_UART` / `DAP_UART_USB_COM_PORT` | 0 / 0 | DAP 内建 UART 未启用（串口走独立 CDC 接口） |
 | `TIMESTAMP_CLOCK` | 1 MHz | 基于 `time_us_32()` |
@@ -253,6 +261,8 @@ static void Set_Clock_Delay(uint32_t clock) {
   probe_set_swclk_freq_hz(clock);
 }
 ```
+
+同一补丁只做这一处替换，`DAP_Info` 上报的 `DAP_PACKET_COUNT` 保持 CMSIS-DAP 配置值不变；本地的多槽缓冲通过 `DAP_BUFFER_COUNT` 单独定义（见 §5.2）。
 
 原始 `lib/CMSIS-DAP` 子模块不做修改，也不参与编译。补丁由 `lib/CMakeLists.txt` 在配置阶段应用，补丁或上游文件变化时自动重新生成。
 
@@ -321,6 +331,48 @@ cmsis-dap cmd 0x80 0x00   # 关闭 VREF 输出
 ```
 
 OpenOCD 打印响应的第 1…4 字节，即 `vref_10x result mv_lo mv_hi`。实测方法见 `docs/test_vref_cmd.md`。
+
+### 6.7 端点统计（Vendor 命令 0x82）
+
+`module/dap/dap_stats.h` 声明统计接口，`tusb_edpt_handler.c` 在收发回调里维护计数，`dap_vendor.c` 把结果通过 `0x82`（`ID_DAP_Vendor2`）暴露给上位机，用于判断吞吐瓶颈在主机侧还是设备侧。
+
+请求为 `[0x82, sel]`，响应固定 5 字节 `[cmd, b0, b1, b2, b3]`，OpenOCD 打印后 4 字节。
+
+| `sel` | 用途 | 4 个数据字节 |
+| --- | --- | --- |
+| `0` | 环形深度 | 请求深度峰值、响应深度峰值、当前请求深度、当前响应深度 |
+| `1` | OUT 包计数 | `out_packets`，小端 32 位 |
+| `2` | IN 包计数 | `in_packets`，小端 32 位 |
+| `3` | 毫秒计数 | 1 ms tick 计数，小端 32 位 |
+| `4` | 清零 | 全 0 |
+| `5` | 命令总耗时 | `busy_us`，小端 32 位 |
+| `6` | 单条命令最长耗时 | 微秒，小端 32 位 |
+| `7` | 请求最小间隔 | 微秒，小端 32 位；无数据时为 0 |
+| `8` | 请求最大间隔 | 微秒，小端 32 位 |
+| `9` | 实际 SWCLK | kHz，小端 32 位 |
+
+用法：
+
+```text
+cmsis-dap cmd 0x82 4   # 清零
+                       # 执行一次扫描
+cmsis-dap cmd 0x82 0   # 深度峰值
+cmsis-dap cmd 0x82 2   # IN 包数
+cmsis-dap cmd 0x82 3   # 毫秒计数
+cmsis-dap cmd 0x82 5   # 命令总耗时（微秒）
+```
+
+判读：
+
+- 响应深度峰值反映主机允许多少个未读响应堆积；OpenOCD v2 后端实际只保持一个包在途，峰值通常为 1（原因见 `docs/openocd_pipeline.md`）。
+- 请求深度峰值是请求环内同时排队的包数；DAP 线程处理很快时这个值通常也只有 1…2，不能单独用来判断主机是否流水线。
+- `in_packets` 除以毫秒差即每秒响应包数，乘以每包有效载荷（OpenOCD 读内存时约 48 字节）可估算吞吐，用来与实测扫描速度对照。
+- `busy_us` 除以包数得到设备处理单条命令的平均时间；它占整个传输时间的比例就是设备占用率，用来判断瓶颈在设备还是总线。
+- 请求间隔的最小值反映主机成串发包的能力，最大值包含扫描开始/结束的间歇。
+- `swclk_khz` 是 PIO 分频后实际生效的 SWCLK，用来核对主机的 `adapter speed` 是否真正生效。
+- 统计命令自身也计入包数；每次 USB 配置时计数清零。
+
+实测方法见 `docs/test_stats_cmd.md`。
 
 ## 7. 目标接口引擎（PIO）
 
