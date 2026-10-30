@@ -39,15 +39,19 @@ openocd -c "adapter driver cmsis-dap; adapter serial 5148E980C9C8E778; transport
 
 ### 2.2 用 DAP_HostStatus 直接控制
 
-`DAP_HostStatus` 命令号为 `0x02`，请求为 `[0x02, type, status]`，`type`：`0` = 调试器已连接，`1` = 目标运行中。
+`DAP_HostStatus` 命令号为 `0x01`，请求为 `[0x01, type, status]`，`type`：`0` = 调试器已连接，`1` = 目标运行中。
 
 ```powershell
 openocd -c "adapter driver cmsis-dap; transport select swd" -c "init" `
-        -c "cmsis-dap cmd 0x02 0x00 0x01" -c "cmsis-dap cmd 0x02 0x01 0x01" `
-        -c "cmsis-dap cmd 0x02 0x01 0x00" -c "cmsis-dap cmd 0x02 0x00 0x00" -c "shutdown"
+        -c "cmsis-dap cmd 0x01 0x00 0x01" -c "sleep 1000" `
+        -c "cmsis-dap cmd 0x01 0x01 0x01" -c "sleep 1000" `
+        -c "cmsis-dap cmd 0x01 0x01 0x00" -c "sleep 1000" `
+        -c "cmsis-dap cmd 0x01 0x00 0x00" -c "sleep 1000" -c "shutdown"
 ```
 
-预期：连接灯亮 → 运行灯亮 → 运行灯灭 → 连接灯灭，每步响应为 `02 00`（命令号 + `DAP_OK`）。
+预期：连接灯亮 → 运行灯亮 → 运行灯灭 → 连接灯灭，每条命令之间间隔 1 s，便于观察。
+
+响应为 `[0x01, 0x00]`（命令号 + `DAP_OK`）。OpenOCD 固定打印响应中命令号之后的 4 字节，所以每次打印的都是 `Returned data 00 00 00 00`，不能据此判断命令是否生效，以灯的动作是否随之变化为准。
 
 ### 2.3 上位机联调
 
