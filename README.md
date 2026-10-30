@@ -13,7 +13,7 @@
 - 状态指示灯：连接灯 GPIO21、运行灯 GPIO22，低电平点亮，由 `DAP_HostStatus` 驱动
 - USB-CDC 转 UART 桥（UART0，DMA + 环形缓冲；TX 随调试模式切换：SWD 用 GPIO0，JTAG 用 GPIO12）
 - IIC1 总线上的 MCP4716A0 参考电压 DAC，可由 Vendor 命令设置或关闭并写入 EEPROM，上电自动恢复
-- 1 s 看门狗，双核心跳；看门狗复位后进入 USB Bootloader
+- 1 s 看门狗：看门狗任务在双核间轮换喂狗，DAP 线程在请求密集时另行喂狗；看门狗复位后进入 USB Bootloader
 
 ## 未完成
 
@@ -71,6 +71,7 @@ cmake --build build -j8
 - SWJ 时钟频率：[docs/test_swj_clock.md](docs/test_swj_clock.md)
 - JTAG 实测步骤与判读：[docs/jtag_diag_plan.md](docs/jtag_diag_plan.md)
 - 状态指示灯与 `DAP_Info` 字符串：[docs/test_led_dap_info.md](docs/test_led_dap_info.md)
+- DAP 线程喂狗与常开任务：[docs/test_dap_watchdog.md](docs/test_dap_watchdog.md)
 
 ## 许可
 

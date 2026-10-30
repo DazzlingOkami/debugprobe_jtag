@@ -125,8 +125,7 @@
 
 调试口引脚不在启动时初始化：`probe_init()` 由 `PORT_SWD_SETUP()` / `PORT_JTAG_SETUP()` 在上位机连接时按需调用（见 `config/DAP_config.h`）。
 
-`start_task` 依次创建看门狗任务、初始化 USB 任务、创建 CDC 线程、初始化 IIC 总线并读取 MCP4716A0 的当前状态（不写寄存器），随后自删除。DAC 读取失败只打印日志，不阻断启动；参考电压由 DAP Vendor 命令配置并写入 EEPROM。
-DAP 线程不在此创建，而是在 USB 挂载回调 `tud_mount_cb()` 中创建。
+`start_task` 依次创建看门狗任务、调用 `usb_init()` 创建 USB 线程与 DAP 线程、创建 CDC 线程、初始化 IIC 总线并读取 MCP4716A0 的当前状态（不写寄存器），随后自删除。DAC 读取失败只打印日志，不阻断启动；参考电压由 DAP Vendor 命令配置并写入 EEPROM。
 
 ### 4.2 任务列表
 
@@ -136,7 +135,7 @@ DAP 线程不在此创建，而是在 USB 挂载回调 `tud_mount_cb()` 中创�
 | `WDOG` | 1 | 512 | `start_task()` | 未绑定（轮流遍历各核喂狗） |
 | `USB` | 2 | `configMINIMAL_STACK_SIZE`(256) | `usb_init()` | 核 0 |
 | `UART` | 3 | 256 | `cdc_thread_create()` | 核 0 |
-| `DAP` | 3 | 256 | `tud_mount_cb()` | 未绑定 |
+| `DAP` | 3 | 256 | `usb_init()` | 核 1 |
 | IDLE / Tmr Svc | 0 / 31 | — | 内核 | — |
 
 `configUSE_TIME_SLICING = 1`，同优先级任务时间片轮转。堆使用 `heap_4`，`configTOTAL_HEAP_SIZE = 100 KB`。
@@ -148,6 +147,7 @@ DAP 线程不在此创建，而是在 USB 挂载回调 `tud_mount_cb()` 中创�
 
 - 若本次复位由看门狗触发，则打印日志并进入 USB Bootloader（`reset_usb_boot(0, 0)`），便于固件失效后重新烧录。
 - 使能 1 s 超时看门狗；SMP 配置下轮流把自身亲和性绑定到各核并调用 `watchdog_update()`，每核间隔 600 ms 喂一次，保证两个核都被覆盖。
+- DAP 线程绑定在核 1 且优先级高于 `WDOG`，请求密集时会把核 1 占满，`WDOG` 无法在该核运行。因此 DAP 线程在每条命令处理前检查时间戳，每 500 ms 调用一次 `watchdog_update()`；`xTaskNotifyWait()` 的等待点会让出 CPU，`WDOG` 仍可在核 1 运行。
 
 ## 5. USB 传输层
 
@@ -205,11 +205,7 @@ DAP 线程识别 `ID_DAP_QueueCommands` 开头的报文，将其就地改写为 
 
 ### 5.4 USB 挂载/卸载
 
-| 回调 | 行为 |
-| --- | --- |
-| `tud_mount_cb` | 删除上次枚举残留的 DAP 线程（总线复位不会触发卸载回调），再创建（优先级 3） |
-| `tud_unmount_cb` | 挂起并删除 DAP 线程，句柄置空 |
-| `tud_suspend_cb` / `tud_resume_cb` | 挂起/恢复 DAP 线程，句柄为空时跳过 |
+DAP 线程在 `usb_init()` 中与 USB 线程一起创建，此后一直运行；`tud_mount_cb()`、`tud_unmount_cb()`、`tud_suspend_cb()` 与 `tud_resume_cb()` 只打印日志，不创建、挂起或删除该线程。重新枚举时由 `dap_edpt_open()` 复位收发环形缓冲的索引，DAP 线程继续使用同一份上下文。
 
 `usb_thread` 调用 `tud_task()` 处理事件；未连接或已挂起时按 1 ms 延时，其余情况用 `xTaskNotifyWait()` 休眠。TinyUSB 在事件入队时调用 `tud_event_hook_cb()`（ISR 与任务上下文分别走 `xTaskNotifyFromISR()` 和 `xTaskNotify()`），USB 线程被立即唤醒，端点回调不会再被 1 ms 的 tick 延迟。
 
