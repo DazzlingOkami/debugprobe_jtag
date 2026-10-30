@@ -10,6 +10,8 @@
 
 static TaskHandle_t usb_taskhandle;
 
+TaskHandle_t dap_taskhandle;
+
 /* TinyUSB queues an event from the USB interrupt; wake usb_thread right away so a
  * transfer callback is not delayed until the next tick */
 void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
@@ -72,54 +74,33 @@ int usb_init(void){
 
     xTaskCreate(usb_thread, "USB", configMINIMAL_STACK_SIZE, NULL, TUD_TASK_PRIO, NULL);
 
+    /* The DAP thread lives for the whole session; mount and unmount only reset
+     * the endpoint rings, so there is nothing to create or delete per mount. */
+    xTaskCreate(dap_thread, "DAP", configMINIMAL_STACK_SIZE, NULL, DAP_TASK_PRIO, &dap_taskhandle);
+
     return 0;
-}
-
-TaskHandle_t dap_taskhandle;
-
-static void dap_task_stop(void)
-{
-    if (dap_taskhandle != NULL)
-    {
-        vTaskSuspend(dap_taskhandle);
-        vTaskDelete(dap_taskhandle);
-        dap_taskhandle = NULL;
-    }
 }
 
 void tud_suspend_cb(bool remote_wakeup_en)
 {
+    (void) remote_wakeup_en;
     probe_info("Suspended\n");
-    /* Join DAP threads? Or just suspend them, for transparency */
-    if (dap_taskhandle != NULL)
-        vTaskSuspend(dap_taskhandle);
     /* slow down clk_sys for power saving ? */
 }
 
 void tud_resume_cb(void)
 {
     probe_info("Resumed\n");
-    if (dap_taskhandle != NULL)
-        vTaskResume(dap_taskhandle);
 }
 
 void tud_unmount_cb(void)
 {
     probe_info("Disconnected\n");
-    dap_task_stop();
 }
 
 void tud_mount_cb(void)
 {
     probe_info("Connected, Configured\n");
-
-    /* A bus reset clears the configuration without unmounting, so a task from
-     * the previous enumeration may still exist. Recreate it to start from a
-     * clean state instead of resuming a possibly stale command loop. */
-    dap_task_stop();
-
-    /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */
-    xTaskCreate(dap_thread, "DAP", configMINIMAL_STACK_SIZE, NULL, DAP_TASK_PRIO, &dap_taskhandle);
 }
 
 
