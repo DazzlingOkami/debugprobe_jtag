@@ -10,10 +10,15 @@
  * 0x81 reports the current setting. The voltage is given in units of 0.1 V
  * (for example 33 = 3.3 V); 0 disables the DAC output. The setting is stored
  * in the DAC EEPROM so it is restored on the next power-up.
+ *
+ * Vendor command 0x83 is a throughput probe: it eats one full-size request
+ * packet without inspecting the payload and returns a short response, so a
+ * host tool can measure the bulk path on its own.
  */
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "DAP_config.h"
 #include "DAP.h"
@@ -24,6 +29,13 @@
 #define DAP_VENDOR_CMD_VREF_SET         ID_DAP_Vendor0
 #define DAP_VENDOR_CMD_VREF_GET         ID_DAP_Vendor1
 #define DAP_VENDOR_CMD_STATS            ID_DAP_Vendor2
+#define DAP_VENDOR_CMD_BENCH            ID_DAP_Vendor3
+
+/* Benchmark command: one full-size request packet in, a short response out.
+ * Response length is selected by the host between these bounds. */
+#define DAP_VENDOR_BENCH_MIN_RESP       (4U)
+#define DAP_VENDOR_BENCH_DEFAULT_RESP   (4U)
+#define DAP_VENDOR_BENCH_STATUS_OK      (0x00U)
 
 /* Accepted voltage range in 0.1 V units; 0 is handled separately as "output off" */
 #define DAP_VENDOR_VREF_MIN_DV          (12U)
@@ -212,6 +224,32 @@ static uint32_t stats_command(uint8_t sel, uint8_t *response)
 #endif
 
 /**
+ * @brief  Consume one full-size request packet and return a short response.
+ * @param  [in]  request  Request buffer; only the sequence and length selector are read
+ * @param  [out] response Response buffer, at least DAP_PACKET_SIZE bytes
+ * @return Request length in the upper 16 bits and response length in the lower 16 bits
+ */
+static uint32_t bench_command(const uint8_t *request, uint8_t *response)
+{
+    uint8_t len = request[3];
+
+    if (len < DAP_VENDOR_BENCH_MIN_RESP) {
+        len = DAP_VENDOR_BENCH_DEFAULT_RESP;
+    } else if (len > DAP_PACKET_SIZE) {
+        len = DAP_PACKET_SIZE;
+    }
+
+    /* The payload is ignored on purpose: only the USB path is under test */
+    memset(response, 0, len);
+    response[0] = DAP_VENDOR_CMD_BENCH;
+    response[1] = request[1];
+    response[2] = request[2];
+    response[3] = DAP_VENDOR_BENCH_STATUS_OK;
+
+    return ((uint32_t)DAP_PACKET_SIZE << 16) | len;
+}
+
+/**
  * @brief  Process a DAP vendor command and prepare the response data.
  * @param  [in]  request  Pointer to the request data
  * @param  [out] response Pointer to the response data
@@ -225,6 +263,9 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
 
     case DAP_VENDOR_CMD_VREF_GET:
         return vref_get(response);
+
+    case DAP_VENDOR_CMD_BENCH:
+        return bench_command(request, response);
 
 #if DAP_STATS_ENABLE
     case DAP_VENDOR_CMD_STATS:
