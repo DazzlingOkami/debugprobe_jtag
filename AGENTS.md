@@ -37,7 +37,7 @@ Windows（1 个变量；picotool 用仓库内 `tools/picotool`，由 CMakeLists.
 - `Preload.cmake` 强制使用 `Unix Makefiles` 生成器。
 - **新增文件必须重新配置 cmake**：`driver/CMakeLists.txt` 用 `file(GLOB driver/*/*.c)` 收集源文件且没有 `CONFIGURE_DEPENDS`，在 `driver/` 下新增目录或 `.c` 文件后，不重新执行 `cmake -S . -B build` 就不会参与编译；改了 `CMakeLists.txt` 同理。
 - 只改源码、不增删文件时可跳过配置，直接增量编译：`cmake --build build -j8`
-- 产物为 `build/xxx.elf/.bin/.hex/.uf2`；链接结束会打印 FLASH/RAM 占用，RAM 余量很小（约 96%），新增全局变量时要留意。
+- 产物为 `build/xxx.elf/.bin/.hex/.uf2`；链接结束会打印 FLASH/RAM 占用。默认 `RelWithDebInfo` + `PICO_COPY_TO_RAM`，代码与常量在 SRAM 中执行，RAM 占用约 198 KB（512 KB 的 38%），新增全局变量时要留意。
 - 只复查个别文件的告警：`touch <文件> && cmake --build build -j8`，再从输出里筛 `warning` / `error`。
 - 改动可提交的标准：`cmake --build build` 退出码为 0 且没有新增告警（对应 Git 规范的「保证构建的连续性」）。
 
