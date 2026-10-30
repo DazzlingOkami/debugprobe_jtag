@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include "hardware/watchdog.h"
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
 #include "dap_stats.h"
@@ -307,6 +308,21 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	return true;
 }
 
+/* Feed the watchdog from this thread: a dense request stream keeps it running
+ * on core 1 and starves the low priority watchdog task there. */
+#define DAP_WATCHDOG_FEED_MS 500U
+
+static void dap_watchdog_feed(void)
+{
+	static TickType_t last_feed;
+	TickType_t now = xTaskGetTickCount();
+
+	if ((now - last_feed) >= pdMS_TO_TICKS(DAP_WATCHDOG_FEED_MS)) {
+		last_feed = now;
+		watchdog_update();
+	}
+}
+
 void dap_thread(void *ptr)
 {
 	uint32_t n;
@@ -318,6 +334,10 @@ void dap_thread(void *ptr)
 	uint16_t resp_len;
 	bool was_empty;
 
+#if (configNUMBER_OF_CORES > 1)
+    vTaskCoreAffinitySet(NULL, 1 << 1);
+#endif
+
 	for (;;)
 	{
 		/* Sleep until a USB callback queued a request or freed a response slot */
@@ -325,6 +345,8 @@ void dap_thread(void *ptr)
 
 		while (USBRequestBuffer.rptr != USBRequestBuffer.wptr)
 		{
+			dap_watchdog_feed();
+
 			/*
 			 * Atomic command support - buffer QueueCommands, but don't process them
 			 * until a non-QueueCommands packet is seen.
