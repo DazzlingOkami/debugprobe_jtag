@@ -3,6 +3,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "dap/tusb_edpt_handler.h"
+#include "dap_board.h"
 #include "DAP.h"
 
 #define TUD_TASK_PRIO 2
@@ -32,6 +33,14 @@ void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
     }
 }
 
+#ifdef PROBE_USB_CONNECTED_LED
+/* Drive the USB status LED; on = lit */
+static void usb_led_out(bool on)
+{
+    gpio_put(PROBE_USB_CONNECTED_LED, on ? (bool)PROBE_LED_ACTIVE_LEVEL : (bool)!PROBE_LED_ACTIVE_LEVEL);
+}
+#endif
+
 static void usb_thread(void *p)
 {
     uint32_t notified;
@@ -41,7 +50,9 @@ static void usb_thread(void *p)
 #endif
 
 #ifdef PROBE_USB_CONNECTED_LED
+    /* The red LED is lit from boot until the host configures the device */
     gpio_init(PROBE_USB_CONNECTED_LED);
+    usb_led_out(true);
     gpio_set_dir(PROBE_USB_CONNECTED_LED, GPIO_OUT);
 #endif
 
@@ -52,10 +63,7 @@ static void usb_thread(void *p)
     do {
         tud_task();
 #ifdef PROBE_USB_CONNECTED_LED
-        if (!gpio_get(PROBE_USB_CONNECTED_LED) && tud_ready())
-            gpio_put(PROBE_USB_CONNECTED_LED, 1);
-        else
-            gpio_put(PROBE_USB_CONNECTED_LED, 0);
+        usb_led_out(!tud_mounted());
 #endif
         // If suspended or disconnected, delay for 1ms (20 ticks)
         if (tud_suspended() || !tud_connected())

@@ -29,32 +29,33 @@ openocd -c "adapter driver cmsis-dap; adapter serial 5148E980C9C8E778; transport
 
 ## 2. 状态指示灯
 
-### 2.1 上电与初始化
+### 2.1 USB 灯
 
 | 步骤 | 预期 |
 | --- | --- |
-| 上电、未插 USB | 连接灯与运行灯均不亮 |
-| 插入 USB、枚举完成 | 两灯仍不亮：指示灯只由 `DAP_HostStatus` 驱动，USB 回调不改灯状态 |
-| 拔掉 USB | 两灯均灭 |
+| 未上电 | 两灯均不亮 |
+| 用仅供电的 USB 线连接主机（D+/D- 不通） | USB 灯亮，DAP 连接灯灭 |
+| 换成数据线，主机枚举完成 | USB 灯灭，DAP 连接灯仍灭 |
+| 拔掉 USB（整机断电） | 两灯均灭 |
 
-### 2.2 用 DAP_HostStatus 直接控制
+USB 灯为红灯，指示的是“主机未配置设备”，与调试器是否连接目标无关。
+
+### 2.2 用 DAP_HostStatus 控制 DAP 连接灯
 
 `DAP_HostStatus` 命令号为 `0x01`，请求为 `[0x01, type, status]`，`type`：`0` = 调试器已连接，`1` = 目标运行中。
 
 ```powershell
 openocd -c "adapter driver cmsis-dap; transport select swd" -c "init" `
         -c "cmsis-dap cmd 0x01 0x00 0x01" -c "sleep 1000" `
-        -c "cmsis-dap cmd 0x01 0x01 0x01" -c "sleep 1000" `
-        -c "cmsis-dap cmd 0x01 0x01 0x00" -c "sleep 1000" `
         -c "cmsis-dap cmd 0x01 0x00 0x00" -c "sleep 1000" -c "shutdown"
 ```
 
-预期：连接灯亮 → 运行灯亮 → 运行灯灭 → 连接灯灭，每条命令之间间隔 1 s，便于观察。
+预期：DAP 连接灯亮 → 灭，两条命令之间间隔 1 s，便于观察。`type = 1`（目标运行中）不驱动任何灯，下发后灯的状态不变。
 
 响应为 `[0x01, 0x00]`（命令号 + `DAP_OK`）。OpenOCD 固定打印响应中命令号之后的 4 字节，所以每次打印的都是 `Returned data 00 00 00 00`，不能据此判断命令是否生效，以灯的动作是否随之变化为准。
 
 ### 2.3 上位机联调
 
-用 pyOCD 或 Keil 连接目标后执行 halt / resume，运行灯应随之熄灭与点亮；若上位机不下发 `DAP_HostStatus`，两灯会一直保持熄灭，属正常。`cmsis-dap cmd` 与上位机交替下发时，两灯状态以最后一条 `DAP_HostStatus` 为准。
+用 pyOCD 或 Keil 连接目标后，DAP 连接灯应点亮，断开调试会话后熄灭；halt / resume 不影响任何灯。若上位机不下发 `DAP_HostStatus`，连接灯会一直保持熄灭，属正常。`cmsis-dap cmd` 与上位机交替下发时，连接灯状态以最后一条 `DAP_HostStatus` 为准。
 
-若两灯的状态与命令相反，把 `config/dap_board.h` 里的 `PROBE_LED_ACTIVE_LEVEL` 由 `0` 改为 `1`（该板为低电平点亮）。
+若灯的亮灭与上述预期相反，把 `config/dap_board.h` 里的 `PROBE_LED_ACTIVE_LEVEL` 由 `0` 改为 `1`（该板为低电平点亮）。

@@ -17,7 +17,7 @@
 | USB-CDC 转 UART 桥 | 已实现（DMA + 环形缓冲） |
 | SWO 跟踪 | 未启用 |
 | 接口缓冲参考电压（MCP4716A0） | 已实现（IIC，Vendor 命令配置并写入 EEPROM，上电自动恢复） |
-| 状态指示灯 | 已实现（连接灯 GPIO21、运行灯 GPIO22） |
+| 状态指示灯 | 已实现（USB 灯 GPIO21、DAP 连接灯 GPIO22） |
 | 看门狗与双核心跳 | 已实现 |
 
 ## 2. 硬件平台
@@ -55,8 +55,8 @@
 | 调试串口 TX | `PICO_DEFAULT_UART_TX_PIN` | 20 | UART1 日志输出 |
 | 调试串口 RX | `PICO_DEFAULT_UART_RX_PIN` | 25 | 未使用 |
 | CDC 桥 UART RX | `PROBE_UART_RX` | 1 | UART0 |
-| 连接指示灯 | `PROBE_DAP_CONNECTED_LED` | 21 | 低电平点亮 |
-| 运行指示灯 | `PROBE_DAP_RUNNING_LED` | 22 | 低电平点亮 |
+| USB 指示灯 | `PROBE_USB_CONNECTED_LED` | 21 | 红灯，低电平点亮 |
+| DAP 连接指示灯 | `PROBE_DAP_CONNECTED_LED` | 22 | 低电平点亮 |
 
 > `PICO_PIO_USE_GPIO_BASE 0`：允许 PIO 直接访问 GPIO32–47 区间。
 
@@ -120,7 +120,7 @@
 4. `cdc_uart_init()`：初始化 UART0（TX 默认在 GPIO0）、TX 缓冲器方向脚、环形缓冲、DMA 通道与 DMA_IRQ_0。
 5. `tusb_init()`：初始化 TinyUSB 设备栈。
 6. `stdio_uart_init()`：日志串口（UART1 / GPIO20）。
-7. `DAP_Setup()`：复位 CMSIS-DAP 内部状态（`DAP_Data`），并把连接灯/运行灯配成输出、初始为熄灭。
+7. `DAP_Setup()`：复位 CMSIS-DAP 内部状态（`DAP_Data`），并把 DAP 连接灯配成输出、初始为熄灭。
 8. 创建 `start` 任务后调用 `vTaskStartScheduler()`。
 
 调试口引脚不在启动时初始化：`probe_init()` 由 `PORT_SWD_SETUP()` / `PORT_JTAG_SETUP()` 在上位机连接时按需调用（见 `config/DAP_config.h`）。
@@ -285,13 +285,14 @@ static void Set_Clock_Delay(uint32_t clock) {
 
 | 引脚 | 宏 | 语义 |
 | --- | --- | --- |
-| GPIO21 | `PROBE_DAP_CONNECTED_LED` | 连接灯：调试器已连接 |
-| GPIO22 | `PROBE_DAP_RUNNING_LED` | 运行灯：目标处于运行状态 |
+| GPIO21 | `PROBE_USB_CONNECTED_LED` | USB 灯（红）：主机未配置设备时点亮 |
+| GPIO22 | `PROBE_DAP_CONNECTED_LED` | DAP 连接灯：调试器已连接 |
 
 LED 为 `3V3 → 电阻 → LED → GPIO` 的灌电流接法，低电平点亮，`PROBE_LED_ACTIVE_LEVEL = 0`。
 
-- `DAP_SETUP()` 在 `main()` 中把两脚配成输出，并先写熄灭电平再切方向，上电不会瞬亮。
-- 两盏灯都只由 `DAP_HostStatus` 控制：`DAP_DEBUGGER_CONNECTED` 驱动连接灯，`DAP_TARGET_RUNNING` 驱动运行灯。USB 挂载/卸载回调不碰指示灯，上位机不下发时两灯保持熄灭。
+- USB 灯由 USB 线程每轮轮询 `tud_mounted()` 驱动：上电后点亮，主机下发 `SET_CONFIGURATION` 后熄灭，设备掉线后重新点亮。
+- DAP 连接灯在 `DAP_SETUP()` 中配成输出，先写熄灭电平再切方向；之后只由 `DAP_HostStatus` 的 `DAP_DEBUGGER_CONNECTED` 控制，USB 挂载/卸载回调不改灯状态。
+- 板上没有运行状态指示灯，`DAP_HostStatus` 的 `DAP_TARGET_RUNNING` 只返回 `DAP_OK`，不驱动任何灯。
 
 两盏灯的实测方法见 `docs/test_led_dap_info.md`。
 

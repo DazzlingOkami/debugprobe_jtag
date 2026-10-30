@@ -64,10 +64,12 @@ pico_board_cmake_set_default(PICO_FLASH_SIZE_BYTES, (2 * 1024 * 1024))
 /* Power-down pull-down: 1 = 1k, 2 = 125k, 3 = 640k to ground */
 #define DAC_MCP4716_PD_RESISTOR (3)
 
-/* Status LEDs: connect LED on GPIO21, running LED on GPIO22
+/* Status LEDs
+ * GPIO21: red LED, lit while the host has not configured the DAP
+ * GPIO22: DAP connected LED, lit while a debugger is connected
  * LEDs sink current from 3V3 through a resistor, so a low level lights them */
-#define PROBE_DAP_CONNECTED_LED (21)
-#define PROBE_DAP_RUNNING_LED   (22)
+#define PROBE_USB_CONNECTED_LED (21)
+#define PROBE_DAP_CONNECTED_LED (22)
 #define PROBE_LED_ACTIVE_LEVEL  (0)
 
 /* DAP_Info strings; must stay consistent with the strings in the USB descriptor */

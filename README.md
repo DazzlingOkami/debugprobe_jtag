@@ -10,7 +10,7 @@
 - SWD 调试通道，PIO 生成时序，时钟频率由上位机通过 `DAP_SWJ_Clock` 设置
 - JTAG 调试通道，与 SWD 共用 PIO 状态机；TDI/TDO/TCK/TMS 由 PIO 驱动，nTRST 为独立 GPIO
 - `DAP_Info` 返回厂商、产品、序列号与固件版本字符串（序列号与 USB 描述符同源）
-- 状态指示灯：连接灯 GPIO21、运行灯 GPIO22，低电平点亮，由 `DAP_HostStatus` 驱动
+- 状态指示灯：USB 灯 GPIO21（红灯，主机未配置设备时点亮）、DAP 连接灯 GPIO22，低电平点亮
 - USB-CDC 转 UART 桥（UART0，DMA + 环形缓冲；TX 随调试模式切换：SWD 用 GPIO0，JTAG 用 GPIO12）
 - IIC1 总线上的 MCP4716A0 参考电压 DAC，可由 Vendor 命令设置或关闭并写入 EEPROM，上电自动恢复
 - 1 s 看门狗：看门狗任务在双核间轮换喂狗，DAP 线程在请求密集时另行喂狗；看门狗复位后进入 USB Bootloader
