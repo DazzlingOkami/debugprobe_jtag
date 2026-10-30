@@ -9,9 +9,9 @@ set(CMAKE_CXX_COMPILER "arm-none-eabi-g++")
 set(CMAKE_ASM_COMPILER "arm-none-eabi-gcc")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
-# Define the build type
+# Define the build type: -O2 with debug info
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Debug")
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type")
 endif()
 
 # Enable CMake support for ASM and C languages
@@ -27,6 +27,9 @@ set(PICO_PLATFORM "rp2350-arm-s")
 set(PICO_FLASH_SIZE_BYTES "2 * 1024 * 1024")
 # Disable coprocessor disassembly
 set(PICO_NO_COPRO_DIS 1)
+# Execute code and constants from SRAM: the XIP cache is small and shared by both
+# cores, so flash code placement alone changes the measured throughput
+set(PICO_COPY_TO_RAM 1 CACHE BOOL "Copy code and rodata into SRAM at boot")
 include(bsp/pico_sdk_import.cmake)
 IF (CMAKE_HOST_WIN32)
     set(picotool_DIR ${CMAKE_CURRENT_LIST_DIR}/tools/picotool/lib/cmake/picotool)
